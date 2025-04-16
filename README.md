@@ -90,4 +90,4 @@ For questions or suggestions, please open an issue or contact the maintainer.
 
 ---
 
-Feel free to connect with me on [LinkedIn](https://www.linkedin.com/in/yourprofile) to discuss this project or potential collaborations!
+Feel free to connect with me on [LinkedIn](https://www.linkedin.com/in/arvindha/) to discuss this project or potential collaborations!
