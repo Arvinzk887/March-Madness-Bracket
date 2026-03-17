@@ -1,25 +1,27 @@
 # March Madness Tournament Simulator (2026)
 
-A sophisticated Python-based simulator that predicts the outcomes of the NCAA March Madness tournament using advanced statistical modeling and probability calculations.
+A Python-based simulator that predicts NCAA March Madness outcomes using statistical modeling, Monte Carlo simulation, and bracket pool expected-value analysis.
 
 ## Features
 
-- **Advanced Statistical Modeling**: Uses team ratings, offensive/defensive efficiency, tempo, and coaching factors
-- **Comprehensive Simulation**: Runs 1,000,000 simulations for accurate predictions
-- **Detailed Analysis**: Provides probabilities for each team reaching different tournament stages
-- **Score Prediction**: Predicts game scores based on team statistics
-- **Bracket Visualization**: Generates a complete predicted bracket
-- **Championship Analysis**: Analyzes potential championship game matchups and scoring outcomes
+- **Statistical modeling**: Team ratings, offensive/defensive efficiency, tempo, experience, and coaching factors
+- **Monte Carlo simulation**: Configurable simulations (default 1M) for advancement probabilities
+- **Win probability model**: Logistic model with tunable chalk/upset calibration; seed matchup diagnostics
+- **Score prediction**: PPP-based model for game totals (calibrated for neutral-court tournament games)
+- **Bracket visualization**: Coherent and marginal-probability brackets
+- **Championship analysis**: Win probabilities and scoring outcomes for Elite Eight, Final Four, and title game
+- **Bracket pool EV**: Compare chalk vs contrarian brackets; rank best single-upset swaps; light/medium/high-variance variants
+- **Backtest foundation**: Structure for historical calibration (bracket + ratings + results)
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/march-madness-simulator.git
-cd march-madness-simulator
+git clone https://github.com/yourusername/March-Madness-Bracket.git
+cd March-Madness-Bracket
 ```
 
-2. Install the required dependencies:
+2. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
@@ -31,51 +33,46 @@ Run the simulator (2026 field):
 python simulator.py
 ```
 
-### Common options
+### CLI options
 
-- **Faster run while iterating**:
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--num-simulations` | 1,000,000 | Number of tournament simulations |
+| `--seed` | None | Random seed for reproducibility |
+| `--progress-every` | 0 | Print progress every N simulations (0 = off) |
+| `--no-scoring` | False | Skip championship scoring analysis |
+| `--score-sims` | 1000 | Simulations per matchup in scoring analysis |
+| `--sanity-checks` | False | Print seed-level diagnostics after simulations |
+| `--pool-ev` | False | Print bracket pool EV: chalk vs contrarian, variants, best upset swaps |
 
+### Example commands
+
+**Faster run while iterating:**
 ```bash
 python simulator.py --num-simulations 20000 --seed 123 --no-scoring
 ```
 
-- **Show progress every N simulations**:
-
+**Bracket pool strategy (best upset picks):**
 ```bash
-python simulator.py --num-simulations 200000 --progress-every 5000 --no-scoring
+python simulator.py --num-simulations 50000 --pool-ev --no-scoring
 ```
 
-- **Include championship scoring analysis (slower)**:
-
+**Full analysis with sanity checks:**
 ```bash
-python simulator.py --num-simulations 200000 --seed 123 --score-sims 1000
+python simulator.py --num-simulations 200000 --sanity-checks --score-sims 500
 ```
-
-The program will:
-1. Run 1,000,000 tournament simulations (configurable via CLI)
-2. Display probabilities for each team reaching different stages
-3. Generate a complete predicted bracket
-4. Analyze potential championship game scenarios
 
 ## How It Works
 
-The simulator uses several key components:
+1. **Team statistics**: Each team is rated on overall strength, offensive/defensive efficiency, tempo, experience, and coaching. Optional overrides (e.g. KenPom-style ratings) can be supplied.
 
-1. **Team Statistics**: Each team is rated based on:
-   - Overall rating
-   - Offensive efficiency
-   - Defensive efficiency
-   - Experience factor
-   - Coaching factor
+2. **Win probability**: Logistic model with composite rating and optional seed nudge. Tunable via `LOGISTIC_SCALE`, `SEED_EDGE_STRENGTH`, and `WIN_WEIGHTS`.
 
-2. **Win Probability Calculation**: Uses a weighted formula considering:
-   - Overall team strength
-   - Offensive/defensive capabilities
-   - Experience and coaching factors
+3. **Game simulation**: Each game sampled from win probability; scores from PPP × possessions with bounded noise.
 
-3. **Game Simulation**: Simulates individual games using probability calculations
+4. **Tournament simulation**: Full bracket resolution per run; aggregates advancement counts across simulations.
 
-4. **Tournament Simulation**: Runs complete tournament simulations to generate probabilities
+5. **Bracket pool EV**: R64 expected scores for chalk vs contrarian picks; ranks single-upset swaps by EV impact; compares chalk, light, medium, and high-variance variants.
 
 ## Contributing
 
