@@ -226,7 +226,7 @@ def simulate_tournament(bracket_data, num_simulations=1000000, *, rng: np.random
             print(f"Running simulation {sim}/{num_simulations}")
             
         current_bracket = resolve_first_four(bracket_data, rng)
-        final_four = []
+        region_winners: dict[str, tuple[str, int]] = {}
         
         for region in current_bracket:
             # Round of 32
@@ -246,9 +246,17 @@ def simulate_tournament(bracket_data, num_simulations=1000000, *, rng: np.random
             
             # Final 4
             regional_winner = simulate_round(current_bracket[region], rng)[0]
-            final_four.append(regional_winner)
+            region_winners[region] = regional_winner
             results['final_four'][regional_winner[0]] += 1
         
+        # Final Four pairings (2026): East vs South, West vs Midwest
+        final_four = [
+            region_winners["East"],
+            region_winners["South"],
+            region_winners["West"],
+            region_winners["Midwest"],
+        ]
+
         # Championship
         championship_game = simulate_round(final_four, rng)
         champion = simulate_round(championship_game, rng)[0][0]
@@ -355,18 +363,30 @@ def print_bracket_predictions(results, bracket_data):
 
     # Final Four
     print("\n=== Final Four ===")
-    south_west = get_most_likely_winner(predictions['elite_8']['South'], predictions['elite_8']['West'], results['final_four'])
-    east_midwest = get_most_likely_winner(predictions['elite_8']['East'], predictions['elite_8']['Midwest'], results['final_four'])
+    east_south = get_most_likely_winner(
+        predictions['elite_8']['East'],
+        predictions['elite_8']['South'],
+        results['final_four']
+    )
+    west_midwest = get_most_likely_winner(
+        predictions['elite_8']['West'],
+        predictions['elite_8']['Midwest'],
+        results['final_four']
+    )
     
-    print(f"South/West: ({predictions['elite_8']['South'][1]}) {predictions['elite_8']['South'][0]} vs " + 
-          f"({predictions['elite_8']['West'][1]}) {predictions['elite_8']['West'][0]} → ({south_west[1]}) {south_west[0]}")
-    print(f"East/Midwest: ({predictions['elite_8']['East'][1]}) {predictions['elite_8']['East'][0]} vs " + 
-          f"({predictions['elite_8']['Midwest'][1]}) {predictions['elite_8']['Midwest'][0]} → ({east_midwest[1]}) {east_midwest[0]}")
+    print(
+        f"East/South: ({predictions['elite_8']['East'][1]}) {predictions['elite_8']['East'][0]} vs "
+        + f"({predictions['elite_8']['South'][1]}) {predictions['elite_8']['South'][0]} → ({east_south[1]}) {east_south[0]}"
+    )
+    print(
+        f"West/Midwest: ({predictions['elite_8']['West'][1]}) {predictions['elite_8']['West'][0]} vs "
+        + f"({predictions['elite_8']['Midwest'][1]}) {predictions['elite_8']['Midwest'][0]} → ({west_midwest[1]}) {west_midwest[0]}"
+    )
     
     # Championship
     print("\nChampionship Game:")
-    champion = get_most_likely_winner(south_west, east_midwest, results['championship_wins'])
-    print(f"({south_west[1]}) {south_west[0]} vs ({east_midwest[1]}) {east_midwest[0]} → ({champion[1]}) {champion[0]}")
+    champion = get_most_likely_winner(east_south, west_midwest, results['championship_wins'])
+    print(f"({east_south[1]}) {east_south[0]} vs ({west_midwest[1]}) {west_midwest[0]} → ({champion[1]}) {champion[0]}")
     
     print("\n=== 2026 Champion ===")
     print(f"({champion[1]}) {champion[0]}")
