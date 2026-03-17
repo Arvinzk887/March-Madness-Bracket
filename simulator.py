@@ -2,183 +2,118 @@ import random
 import numpy as np
 from collections import defaultdict
 
-# 2025 NCAA Tournament bracket data
+# 2026 NCAA Tournament bracket data (official first-round matchups)
 bracket_data = {
-    "South": [
-        ("Auburn", 1), ("Alabama State/St. Francis (PA)", 16),
-        ("Louisville", 8), ("Creighton", 9),
-        ("Michigan", 5), ("UC San Diego", 12),
-        ("Texas A&M", 4), ("Yale", 13),
-        ("Ole Miss", 6), ("San Diego State/UNC", 11),
-        ("Iowa State", 3), ("Lipscomb", 14),
-        ("Marquette", 7), ("New Mexico", 10),
-        ("Michigan State", 2), ("Bryant", 15)
-        
+    # Note: some 11/16 seeds come from the First Four and are represented as "A/B"
+    "East": [
+        ("Duke", 1), ("Siena", 16),
+        ("Ohio St.", 8), ("TCU", 9),
+        ("St. John's", 5), ("Northern Iowa", 12),
+        ("Kansas", 4), ("Cal Baptist", 13),
+        ("Louisville", 6), ("South Florida", 11),
+        ("Michigan St.", 3), ("North Dakota St.", 14),
+        ("UCLA", 7), ("UCF", 10),
+        ("UConn", 2), ("Furman", 15)
     ],
     "West": [
-        ("Florida", 1), ("Norfolk State", 16),
-        ("UConn", 8), ("Oklahoma", 9),
-        ("Memphis", 5), ("Colorado State", 12),
-        ("Maryland", 4), ("Grand Canyon", 13),
-        ("Missouri", 6), ("Drake", 11),
-        ("Texas Tech", 3), ("UNC Wilmington", 14),
-         ("Kansas", 7), ("Arkansas", 10),
-        ("St. John's", 2), ("Omaha", 15)
-     
+        ("Arizona", 1), ("Long Island", 16),
+        ("Villanova", 8), ("Utah St.", 9),
+        ("Wisconsin", 5), ("High Point", 12),
+        ("Arkansas", 4), ("Hawaii", 13),
+        ("BYU", 6), ("Texas/NC State", 11),
+        ("Gonzaga", 3), ("Kennesaw St.", 14),
+        ("Miami (FL)", 7), ("Missouri", 10),
+        ("Purdue", 2), ("Queens (N.C.)", 15)
     ],
-    "East": [
-        ("Duke", 1), ("American/Mount St. Mary's", 16),
-        ("Mississippi State", 8), ("Baylor", 9),
-        ("Oregon", 5), ("Liberty", 12),
-        ("Arizona", 4), ("Akron", 13),
-        ("BYU", 6), ("VCU", 11),
-        ("Wisconsin", 3), ("Montana", 14),
-        ("Saint Mary's", 7), ("Vanderbilt", 10),
-        ("Alabama", 2), ("Robert Morris", 15)
-
+    "South": [
+        ("Florida", 1), ("Prairie View A&M/Lehigh", 16),
+        ("Clemson", 8), ("Iowa", 9),
+        ("Vanderbilt", 5), ("McNeese", 12),
+        ("Nebraska", 4), ("Troy", 13),
+        ("North Carolina", 6), ("VCU", 11),
+        ("Illinois", 3), ("Penn", 14),
+        ("Saint Mary's", 7), ("Texas A&M", 10),
+        ("Houston", 2), ("Idaho", 15)
     ],
     "Midwest": [
-        ("Houston", 1), ("SIU Edwardsville", 16),
-        ("Gonzaga", 8), ("Georgia", 9),
-        ("Clemson", 5), ("McNeese", 12),
-        ("Purdue", 4), ("High Point", 13),
-        ("Illinois", 6), ("Texas/Xavier", 11),
-        ("Kentucky", 3), ("Troy", 14),
-        ("UCLA", 7), ("Utah State", 10),
-        ("Tennessee", 2), ("Wofford", 15) 
-
+        ("Michigan", 1), ("UMBC/Howard", 16),
+        ("Georgia", 8), ("Saint Louis", 9),
+        ("Texas Tech", 5), ("Akron", 12),
+        ("Alabama", 4), ("Hofstra", 13),
+        ("Tennessee", 6), ("Miami (Ohio)/SMU", 11),
+        ("Virginia", 3), ("Wright St.", 14),
+        ("Kentucky", 7), ("Santa Clara", 10),
+        ("Iowa St.", 2), ("Tennessee St.", 15)
     ]
-    
 }
 
-# Original team ratings
+# Baseline team ratings (optional overrides). Teams not listed will be seeded-based defaults.
 team_ratings = {
-    # South Region
-    "Auburn": 87.7, "Alabama State/St. Francis (PA)": 45.2,
-    "Michigan State": 82.1, "Bryant": 51.3,
-    "Iowa State": 89.2, "Lipscomb": 53.8,
-    "Texas A&M": 81.4, "Yale": 67.2,
-    "Michigan": 78.9, "UC San Diego": 58.4,
-    "Ole Miss": 80.3, "San Diego State/UNC": 82.5,
-    "Marquette": 85.6, "New Mexico": 79.8,
-    "Louisville": 76.2, "Creighton": 86.9,
-    
-    # East Region
-    "Duke": 86.8, "American/Mount St. Mary's": 46.1,
-    "Alabama": 88.4, "Robert Morris": 50.7,
-    "Wisconsin": 83.5, "Montana": 54.2,
-    "Arizona": 89.7, "Akron": 65.8,
-    "Oregon": 82.3, "Liberty": 63.4,
-    "BYU": 87.2, "VCU": 77.3,
-    "Saint Mary's": 84.1, "Vanderbilt": 75.6,
-    "Mississippi State": 81.8, "Baylor": 83.2,
-    
-    # Midwest Region
-    "Houston": 93.8, "SIU Edwardsville": 44.9,
-    "Tennessee": 90.2, "Wofford": 52.1,
-    "Kentucky": 87.9, "Troy": 55.3,
-    "Purdue": 92.1, "High Point": 54.7,
-    "Clemson": 84.3, "McNeese": 71.2,
-    "Illinois": 86.7, "Texas/Xavier": 81.9,
-    "UCLA": 82.4, "Utah State": 80.1,
-    "Gonzaga": 85.3, "Georgia": 77.8,
-    
-    # West Region
-    "Florida": 85.9, "Norfolk State": 45.8,
-    "St. John's": 83.7, "Omaha": 49.9,
-    "Texas Tech": 84.8, "UNC Wilmington": 66.3,
-    "Maryland": 79.6, "Grand Canyon": 68.4,
-    "Memphis": 83.9, "Colorado State": 78.5,
-    "Missouri": 77.4, "Drake": 79.2,
-    "Kansas": 85.7, "Arkansas": 78.3,
-    "UConn": 91.4, "Oklahoma": 83.6,
+    "Duke": 86.8,
+    "Arizona": 89.7,
+    "Michigan": 84.0,
+    "Florida": 85.9,
+    "Houston": 93.8,
+    "Purdue": 92.1,
+    "UConn": 91.4,
+    "Illinois": 86.7,
+    "Gonzaga": 85.3,
+    "Kansas": 85.7,
+    "Tennessee": 90.2,
+    "Kentucky": 87.9,
+    "Alabama": 88.4,
+    "Iowa St.": 89.2,
+    "Michigan St.": 82.1,
+    "Wisconsin": 83.5,
+    "St. John's": 83.7,
+    "Louisville": 76.2,
+    "UCLA": 82.4,
+    "North Carolina": 84.0,
+    "Clemson": 84.3,
+    "Vanderbilt": 75.6,
+    "Saint Mary's": 84.1,
+    "Texas Tech": 84.8,
+    "BYU": 87.2,
+    "Arkansas": 78.3,
 }
 
-# Enhanced team statistics
-team_stats = {
-    # South Region
-    "Auburn": [87.7, 115.2, 95.3, 7.8, 8.5],  # Strong offense, Bruce Pearl coaching
-    "Alabama State/St. Francis (PA)": [45.2, 98.1, 108.4, 5.0, 4.0],  # Lower division stats
-    "Michigan State": [82.1, 111.3, 97.8, 7.5, 9.5],  # Tom Izzo coaching boost
-    "Bryant": [51.3, 101.2, 105.6, 4.5, 4.5],
-    "Iowa State": [89.2, 114.5, 94.2, 7.8, 8.0],  # Strong defensive team
-    "Lipscomb": [53.8, 102.3, 104.8, 5.0, 4.8],
-    "Texas A&M": [81.4, 110.8, 98.2, 7.2, 7.8],
-    "Yale": [67.2, 106.5, 101.2, 6.5, 6.0],  # Solid fundamentals
-    "Michigan": [78.9, 109.7, 99.1, 6.8, 7.5],
-    "UC San Diego": [58.4, 103.4, 103.9, 5.2, 5.0],
-    "Ole Miss": [80.3, 110.2, 98.7, 7.0, 7.2],
-    "San Diego State/UNC": [82.5, 111.5, 97.6, 7.3, 8.0],  # Tournament experience
-    "Marquette": [85.6, 113.8, 96.2, 7.6, 8.2],  # Strong offensive team
-    "New Mexico": [79.8, 109.9, 98.9, 6.9, 7.0],
-    "Louisville": [76.2, 108.4, 100.1, 6.5, 7.0],
-    "Creighton": [86.9, 114.2, 95.8, 7.7, 8.3],  # Efficient offense
+def _seed_based_overall(seed: int) -> float:
+    seed = max(1, min(16, int(seed)))
+    return 92.0 - (seed - 1) * 3.0  # 1-seed ~92, 16-seed ~47
 
-    # East Region
-    "Duke": [86.8, 114.0, 96.0, 7.8, 8.8],  # Traditional power
-    "American/Mount St. Mary's": [46.1, 98.5, 107.8, 4.8, 4.2],
-    "Alabama": [88.4, 115.8, 95.5, 7.6, 8.4],  # Fast-paced offense
-    "Robert Morris": [50.7, 100.5, 106.2, 4.7, 4.5],
-    "Wisconsin": [83.5, 111.2, 96.8, 7.4, 8.2],  # Strong fundamentals
-    "Montana": [54.2, 102.8, 104.5, 5.1, 4.9],
-    "Arizona": [89.7, 116.2, 94.8, 7.9, 8.6],  # Elite offense
-    "Akron": [65.8, 105.8, 102.5, 5.8, 5.5],
-    "Oregon": [82.3, 111.8, 97.2, 7.2, 8.0],
-    "Liberty": [63.4, 104.8, 103.2, 5.6, 5.4],
-    "BYU": [87.2, 114.5, 95.6, 7.5, 8.1],  # Strong shooting team
-    "VCU": [77.3, 108.8, 99.5, 6.8, 7.2],  # Pressure defense
-    "Saint Mary's": [84.1, 112.5, 96.5, 7.3, 8.0],
-    "Vanderbilt": [75.6, 108.2, 100.2, 6.6, 7.0],
-    "Mississippi State": [81.8, 110.5, 97.8, 7.1, 7.6],
-    "Baylor": [83.2, 112.2, 96.9, 7.4, 8.3],  # Scott Drew coaching
+def _iter_bracket_teams(bracket: dict) -> list[tuple[str, int]]:
+    teams: list[tuple[str, int]] = []
+    for region_matchups in bracket.values():
+        for team, seed in region_matchups:
+            teams.append((team, seed))
+    return teams
 
-    # Midwest Region
-    "Houston": [93.8, 117.5, 92.1, 8.5, 9.0],  # Elite defense, Kelvin Sampson
-    "SIU Edwardsville": [44.9, 97.8, 108.6, 4.6, 4.0],
-    "Tennessee": [90.2, 115.6, 93.8, 8.0, 8.7],  # Strong defense
-    "Wofford": [52.1, 101.8, 105.2, 4.9, 4.7],
-    "Kentucky": [87.9, 115.4, 95.2, 7.7, 9.2],  # Calipari coaching boost
-    "Troy": [55.3, 103.2, 104.2, 5.2, 5.0],
-    "Purdue": [92.1, 116.8, 93.0, 8.3, 8.5],  # Zach Edey effect
-    "High Point": [54.7, 102.5, 104.8, 5.0, 4.8],
-    "Clemson": [84.3, 112.8, 96.4, 7.4, 7.8],
-    "McNeese": [71.2, 107.2, 101.5, 6.2, 6.0],
-    "Illinois": [86.7, 114.2, 95.5, 7.6, 8.1],
-    "Texas/Xavier": [81.9, 111.2, 97.5, 7.2, 7.8],
-    "UCLA": [82.4, 111.5, 97.2, 7.3, 8.4],  # Mick Cronin coaching
-    "Utah State": [80.1, 110.2, 98.4, 7.0, 7.4],
-    "Gonzaga": [85.3, 113.8, 96.2, 7.5, 8.8],  # Few coaching boost
-    "Georgia": [77.8, 109.2, 99.2, 6.8, 7.2],
+def _ensure_team_factors(bracket: dict) -> dict[str, list[float]]:
+    """
+    Returns per-team factors:
+      [overall, offense_eff, defense_eff, experience, coach]
+    Ensures all teams in the bracket have entries, using `team_ratings` + seed defaults.
+    """
+    factors: dict[str, list[float]] = {}
 
-    # West Region
-    "Florida": [85.9, 113.5, 96.0, 7.6, 8.2],
-    "Norfolk State": [45.8, 98.2, 108.2, 4.7, 4.2],
-    "St. John's": [83.7, 112.4, 96.8, 7.3, 7.8],
-    "Omaha": [49.9, 100.2, 106.5, 4.6, 4.4],
-    "Texas Tech": [84.8, 112.8, 96.2, 7.4, 8.0],
-    "UNC Wilmington": [66.3, 105.5, 102.8, 5.8, 5.6],
-    "Maryland": [79.6, 109.8, 98.8, 7.0, 7.6],
-    "Grand Canyon": [68.4, 106.8, 102.0, 6.0, 5.8],
-    "Memphis": [83.9, 112.5, 96.5, 7.3, 7.8],
-    "Colorado State": [78.5, 109.5, 99.0, 6.9, 7.2],
-    "Missouri": [77.4, 109.0, 99.5, 6.8, 7.0],
-    "Drake": [79.2, 109.8, 98.6, 6.9, 7.2],
-    "Kansas": [85.7, 113.8, 96.1, 7.5, 9.0],  # Bill Self coaching boost
-    "Arkansas": [78.3, 109.4, 99.2, 6.8, 7.4],
-    "UConn": [91.4, 116.5, 93.2, 8.2, 8.7],  # Defending champs boost
-    "Oklahoma": [83.6, 112.2, 96.8, 7.3, 7.8]
-}
+    for team, seed in _iter_bracket_teams(bracket):
+        base_overall = float(team_ratings.get(team, _seed_based_overall(seed)))
+        offense = 98.0 + (base_overall - 50.0) * 0.55
+        defense = 110.0 - (base_overall - 50.0) * 0.45  # lower is better
+        experience = 6.0 + (base_overall - 70.0) / 20.0
+        coach = 6.0 + (base_overall - 70.0) / 25.0
 
-for team in team_ratings.keys():
-    if team not in team_stats:
-        base_rating = team_ratings[team]
-        team_stats[team] = [
-            base_rating,
-            base_rating + 20,  # Offensive rating
-            120 - base_rating,  # Defensive rating (lower is better)
-            6.0,  # Default experience rating
-            6.0   # Default coach rating
+        factors[team] = [
+            base_overall,
+            float(np.clip(offense, 95.0, 125.0)),
+            float(np.clip(defense, 85.0, 115.0)),
+            float(np.clip(experience, 4.0, 9.5)),
+            float(np.clip(coach, 4.0, 9.5)),
         ]
+
+    return factors
+
+team_stats = _ensure_team_factors(bracket_data)
 
 def calculate_win_probability(team1, team2):
     """Calculate win probability using multiple factors"""
@@ -293,11 +228,6 @@ def print_results(results, num_simulations):
             prob = (appearances/num_simulations)*100
             print(f"{team}: {prob:.1f}% ({appearances} times)")
 
-# Run the simulation
-print("Running 2025 tournament simulations...")
-simulation_results = simulate_tournament(bracket_data, num_simulations=1000000)
-print_results(simulation_results, 1000000)
-
 def print_bracket_predictions(results, bracket_data):
     """
     Print a visual representation of the predicted bracket based on simulation results.
@@ -308,7 +238,7 @@ def print_bracket_predictions(results, bracket_data):
         prob2 = round_results.get(team2[0], 0)
         return team1 if prob1 > prob2 else team2
 
-    print("\n=== 2025 NCAA Tournament Predictions ===\n")
+    print("\n=== 2026 NCAA Tournament Predictions ===\n")
 
     # Store predictions for each round
     predictions = {
@@ -393,87 +323,43 @@ def print_bracket_predictions(results, bracket_data):
     champion = get_most_likely_winner(south_west, east_midwest, results['championship_wins'])
     print(f"({south_west[1]}) {south_west[0]} vs ({east_midwest[1]}) {east_midwest[0]} → ({champion[1]}) {champion[0]}")
     
-    print("\n=== 2025 Champion ===")
+    print("\n=== 2026 Champion ===")
     print(f"({champion[1]}) {champion[0]}")
 
-# Run the simulation
-print("Running 2025 tournament simulations...")
-simulation_results = simulate_tournament(bracket_data, num_simulations=1000000)
-print_results(simulation_results, 1000000)
-print_bracket_predictions(simulation_results, bracket_data)
-# Team statistics dictionary (offensive efficiency, defensive efficiency, tempo)
-team_stats = {
-    'UConn': {'offense': 124.5, 'defense': 94.2, 'tempo': 67.5},
-    'Houston': {'offense': 116.8, 'defense': 87.3, 'tempo': 65.8},
-    'Purdue': {'offense': 121.7, 'defense': 94.8, 'tempo': 66.2},
-    'Tennessee': {'offense': 115.8, 'defense': 90.5, 'tempo': 67.1},
-    'Arizona': {'offense': 120.3, 'defense': 96.5, 'tempo': 71.4},
-    'Marquette': {'offense': 118.9, 'defense': 95.8, 'tempo': 68.9},
-    'North Carolina': {'offense': 119.2, 'defense': 96.7, 'tempo': 69.8},
-    'Iowa State': {'offense': 114.5, 'defense': 91.2, 'tempo': 66.4},
-    'Duke': {'offense': 117.8, 'defense': 95.6, 'tempo': 67.8},
-    'Illinois': {'offense': 117.2, 'defense': 97.8, 'tempo': 69.5},
-    'Kentucky': {'offense': 121.5, 'defense': 99.2, 'tempo': 70.2},
-    'Auburn': {'offense': 118.2, 'defense': 92.1, 'tempo': 69.8},
-    'Creighton': {'offense': 116.9, 'defense': 93.4, 'tempo': 67.2},
-    'Baylor': {'offense': 117.5, 'defense': 98.2, 'tempo': 68.7},
-    'Kansas': {'offense': 115.8, 'defense': 96.8, 'tempo': 67.9},
-    'Gonzaga': {'offense': 119.4, 'defense': 97.5, 'tempo': 70.1},
-    'Texas': {'offense': 115.2, 'defense': 95.8, 'tempo': 68.4},
-    'Alabama': {'offense': 118.8, 'defense': 98.4, 'tempo': 71.8},
-    'Wisconsin': {'offense': 112.5, 'defense': 95.2, 'tempo': 64.8},
-    'San Diego St': {'offense': 111.8, 'defense': 94.1, 'tempo': 65.2},
-    'Washington St': {'offense': 113.5, 'defense': 95.8, 'tempo': 66.4},
-    'Florida': {'offense': 115.8, 'defense': 97.2, 'tempo': 69.5},
-    'Texas A&M': {'offense': 113.2, 'defense': 96.8, 'tempo': 68.7},
-    'Colorado': {'offense': 114.5, 'defense': 97.5, 'tempo': 68.2},
-    'Dayton': {'offense': 113.8, 'defense': 95.4, 'tempo': 65.8},
-    'Nevada': {'offense': 112.5, 'defense': 96.2, 'tempo': 66.5},
-    'Texas Tech': {'offense': 112.8, 'defense': 96.5, 'tempo': 67.8},
-    'FAU': {'offense': 112.2, 'defense': 96.8, 'tempo': 67.2},
-    'Nebraska': {'offense': 113.5, 'defense': 97.2, 'tempo': 68.4},
-    'Northwestern': {'offense': 111.8, 'defense': 96.5, 'tempo': 65.8},
-    'Mississippi St': {'offense': 111.5, 'defense': 95.8, 'tempo': 66.2},
-    'Utah St': {'offense': 114.2, 'defense': 98.5, 'tempo': 68.5},
-    'New Mexico': {'offense': 114.8, 'defense': 98.2, 'tempo': 69.2},
-    'Michigan St': {'offense': 112.5, 'defense': 97.5, 'tempo': 67.2},
-    'St. Mary\'s': {'offense': 113.2, 'defense': 94.8, 'tempo': 64.5},
-    'BYU': {'offense': 115.5, 'defense': 97.2, 'tempo': 68.8},
-    'Drake': {'offense': 111.8, 'defense': 96.5, 'tempo': 65.8},
-    'Grand Canyon': {'offense': 110.5, 'defense': 97.2, 'tempo': 66.4},
-    'South Carolina': {'offense': 111.2, 'defense': 97.8, 'tempo': 67.5},
-    'Oregon': {'offense': 113.5, 'defense': 98.4, 'tempo': 68.2},
-    'Vermont': {'offense': 110.2, 'defense': 98.5, 'tempo': 64.8},
-    'Yale': {'offense': 109.8, 'defense': 98.2, 'tempo': 65.2},
-    'Samford': {'offense': 111.5, 'defense': 99.5, 'tempo': 70.5},
-    'Charleston': {'offense': 110.8, 'defense': 98.8, 'tempo': 69.2},
-    'Colgate': {'offense': 109.5, 'defense': 99.2, 'tempo': 65.8},
-    'UAB': {'offense': 111.2, 'defense': 99.5, 'tempo': 68.5},
-    'Western Ky': {'offense': 110.5, 'defense': 99.8, 'tempo': 67.8},
-    'Montana St': {'offense': 109.2, 'defense': 99.5, 'tempo': 66.5},
-    'Longwood': {'offense': 108.8, 'defense': 99.8, 'tempo': 66.2},
-    'Morehead St': {'offense': 108.5, 'defense': 100.2, 'tempo': 65.8},
-    'Howard': {'offense': 108.2, 'defense': 100.5, 'tempo': 67.2},
-    'Wagner': {'offense': 107.8, 'defense': 100.8, 'tempo': 64.5},
-    'Stetson': {'offense': 108.5, 'defense': 101.2, 'tempo': 66.8},
-    'Grambling': {'offense': 107.5, 'defense': 101.5, 'tempo': 65.5}
-}
+def _ensure_team_tempo_stats(bracket: dict) -> dict[str, dict[str, float]]:
+    """
+    Build a tempo-based stats dict for score predictions:
+      {team: {offense, defense, tempo}}
+    Ensures all bracket teams are present, derived from `team_stats`.
+    """
+    tempo_stats: dict[str, dict[str, float]] = {}
+    for team, seed in _iter_bracket_teams(bracket):
+        overall, off_eff, def_eff, _, _ = team_stats[team]
+        tempo = 66.0 + (overall - 70.0) * 0.15 + (8 - seed) * 0.05
+        tempo_stats[team] = {
+            "offense": float(np.clip(off_eff + (overall - 75.0) * 0.15, 98.0, 128.0)),
+            "defense": float(np.clip(def_eff - (overall - 75.0) * 0.10, 85.0, 112.0)),
+            "tempo": float(np.clip(tempo, 61.0, 74.0)),
+        }
+    return tempo_stats
+
+team_tempo_stats = _ensure_team_tempo_stats(bracket_data)
 
 def predict_game_score(team1, team2):
     """Predict the score for a game between two teams"""
-    if team1 not in team_stats or team2 not in team_stats:
+    if team1 not in team_tempo_stats or team2 not in team_tempo_stats:
         raise ValueError(f"Missing stats for {team1} or {team2}")
     
     # Average the tempo of both teams to estimate possessions
-    possessions = (team_stats[team1]['tempo'] + team_stats[team2]['tempo']) / 2
+    possessions = (team_tempo_stats[team1]['tempo'] + team_tempo_stats[team2]['tempo']) / 2
     
     # Calculate points per possession
-    team1_ppp = team_stats[team1]['offense'] / 100
-    team2_ppp = team_stats[team2]['offense'] / 100
+    team1_ppp = team_tempo_stats[team1]['offense'] / 100
+    team2_ppp = team_tempo_stats[team2]['offense'] / 100
     
     # Adjust for opponent's defense
-    team1_ppp *= (100 / team_stats[team2]['defense'])
-    team2_ppp *= (100 / team_stats[team1]['defense'])
+    team1_ppp *= (100 / team_tempo_stats[team2]['defense'])
+    team2_ppp *= (100 / team_tempo_stats[team1]['defense'])
     
     # Calculate base scores
     team1_base = team1_ppp * possessions
@@ -534,14 +420,22 @@ def analyze_championship_scoring(final_four_teams):
             over_prob = sum(1 for s in total_scores if s > points) / len(total_scores) * 100
             print(f"Over {points}: {over_prob:.1f}%")
 
-# Get Final Four teams from the simulation results
-final_four_teams = []
-for region in ['South', 'West', 'East', 'Midwest']:
-    teams_in_region = [(team, count) for team, count in simulation_results['final_four'].items() 
-                       if team in [t[0] for t in bracket_data[region]]]
-    if teams_in_region:
-        top_team = max(teams_in_region, key=lambda x: x[1])
-        final_four_teams.append((top_team[0], None))
+if __name__ == "__main__":
+    num_simulations = 1_000_000
+    print("Running 2026 tournament simulations...")
+    simulation_results = simulate_tournament(bracket_data, num_simulations=num_simulations)
+    print_results(simulation_results, num_simulations)
+    print_bracket_predictions(simulation_results, bracket_data)
 
-# Run the scoring analysis
-analyze_championship_scoring(final_four_teams)
+    # Get Final Four teams (most frequent by region) and analyze scoring
+    final_four_teams = []
+    for region in ["South", "West", "East", "Midwest"]:
+        teams_in_region = [
+            (team, count)
+            for team, count in simulation_results["final_four"].items()
+            if team in [t[0] for t in bracket_data[region]]
+        ]
+        if teams_in_region:
+            top_team = max(teams_in_region, key=lambda x: x[1])
+            final_four_teams.append((top_team[0], None))
+    analyze_championship_scoring(final_four_teams)

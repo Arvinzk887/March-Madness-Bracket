@@ -1,4 +1,4 @@
-# March Madness Tournament Simulator
+# March Madness Tournament Simulator (2026)
 
 A sophisticated Python-based simulator that predicts the outcomes of the NCAA March Madness tournament using advanced statistical modeling and probability calculations.
 
@@ -26,13 +26,13 @@ pip install -r requirements.txt
 
 ## Usage
 
-Run the simulator:
+Run the simulator (2026 field):
 ```bash
 python simulator.py
 ```
 
 The program will:
-1. Run 1,000,000 tournament simulations
+1. Run 1,000,000 tournament simulations (configurable in `simulator.py`)
 2. Display probabilities for each team reaching different stages
 3. Generate a complete predicted bracket
 4. Analyze potential championship game scenarios
