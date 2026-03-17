@@ -31,8 +31,28 @@ Run the simulator (2026 field):
 python simulator.py
 ```
 
+### Common options
+
+- **Faster run while iterating**:
+
+```bash
+python simulator.py --num-simulations 20000 --seed 123 --no-scoring
+```
+
+- **Show progress every N simulations**:
+
+```bash
+python simulator.py --num-simulations 200000 --progress-every 5000 --no-scoring
+```
+
+- **Include championship scoring analysis (slower)**:
+
+```bash
+python simulator.py --num-simulations 200000 --seed 123 --score-sims 1000
+```
+
 The program will:
-1. Run 1,000,000 tournament simulations (configurable in `simulator.py`)
+1. Run 1,000,000 tournament simulations (configurable via CLI)
 2. Display probabilities for each team reaching different stages
 3. Generate a complete predicted bracket
 4. Analyze potential championship game scenarios
