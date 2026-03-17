@@ -1,4 +1,4 @@
-import random
+import argparse
 import numpy as np
 from collections import defaultdict
 
@@ -77,6 +77,13 @@ team_ratings = {
     "Arkansas": 78.3,
 }
 
+def _is_play_in_team(team_name: str) -> bool:
+    return "/" in team_name
+
+def _split_play_in(team_name: str) -> tuple[str, str]:
+    left, right = team_name.split("/", 1)
+    return left.strip(), right.strip()
+
 def _seed_based_overall(seed: int) -> float:
     seed = max(1, min(16, int(seed)))
     return 92.0 - (seed - 1) * 3.0  # 1-seed ~92, 16-seed ~47
@@ -97,19 +104,25 @@ def _ensure_team_factors(bracket: dict) -> dict[str, list[float]]:
     factors: dict[str, list[float]] = {}
 
     for team, seed in _iter_bracket_teams(bracket):
-        base_overall = float(team_ratings.get(team, _seed_based_overall(seed)))
-        offense = 98.0 + (base_overall - 50.0) * 0.55
-        defense = 110.0 - (base_overall - 50.0) * 0.45  # lower is better
-        experience = 6.0 + (base_overall - 70.0) / 20.0
-        coach = 6.0 + (base_overall - 70.0) / 25.0
+        # If this is a play-in placeholder (e.g., "A/B"), ensure *both* A and B get stats.
+        teams_to_add = [team]
+        if _is_play_in_team(team):
+            teams_to_add = list(_split_play_in(team))
 
-        factors[team] = [
-            base_overall,
-            float(np.clip(offense, 95.0, 125.0)),
-            float(np.clip(defense, 85.0, 115.0)),
-            float(np.clip(experience, 4.0, 9.5)),
-            float(np.clip(coach, 4.0, 9.5)),
-        ]
+        for t in teams_to_add:
+            base_overall = float(team_ratings.get(t, _seed_based_overall(seed)))
+            offense = 98.0 + (base_overall - 50.0) * 0.55
+            defense = 110.0 - (base_overall - 50.0) * 0.45  # lower is better
+            experience = 6.0 + (base_overall - 70.0) / 20.0
+            coach = 6.0 + (base_overall - 70.0) / 25.0
+
+            factors[t] = [
+                base_overall,
+                float(np.clip(offense, 95.0, 125.0)),
+                float(np.clip(defense, 85.0, 115.0)),
+                float(np.clip(experience, 4.0, 9.5)),
+                float(np.clip(coach, 4.0, 9.5)),
+            ]
 
     return factors
 
@@ -148,25 +161,57 @@ def calculate_win_probability(team1, team2):
     
     # Calculate win probability using logistic function
     diff = score1 - score2
-    return 1 / (1 + np.exp(-diff/15))
+    return 1 / (1 + np.exp(-diff / 15))
 
-def simulate_game(team1, team2):
+def simulate_game(team1, team2, rng: np.random.Generator):
     """Simulate a single game between two teams."""
     prob_team1 = calculate_win_probability(team1, team2)
-    return team1 if random.random() < prob_team1 else team2
+    return team1 if rng.random() < prob_team1 else team2
 
-def simulate_round(matchups):
+def simulate_round(matchups, rng: np.random.Generator):
     """Simulate one round of games."""
     winners = []
     for i in range(0, len(matchups), 2):
         team1, seed1 = matchups[i]
         team2, seed2 = matchups[i + 1]
-        winner = simulate_game(team1, team2)
+        winner = simulate_game(team1, team2, rng)
         winner_seed = seed1 if winner == team1 else seed2
         winners.append((winner, winner_seed))
     return winners
 
-def simulate_tournament(bracket_data, num_simulations=1000000): #Running 1,000,000 simulations
+def validate_bracket(bracket: dict) -> None:
+    expected_regions = {"South", "West", "East", "Midwest"}
+    got_regions = set(bracket.keys())
+    if got_regions != expected_regions:
+        raise ValueError(f"Bracket regions must be {sorted(expected_regions)}; got {sorted(got_regions)}")
+
+    for region, matchups in bracket.items():
+        if len(matchups) != 16:
+            raise ValueError(f"{region} must have 16 team entries (8 games); got {len(matchups)}")
+
+        seeds = [seed for _, seed in matchups]
+        if set(seeds) != set(range(1, 17)):
+            raise ValueError(f"{region} seeds must be 1-16 exactly once; got {sorted(seeds)}")
+
+def resolve_first_four(bracket: dict, rng: np.random.Generator) -> dict:
+    """
+    Replace any play-in placeholders like 'A/B' with a simulated winner (A vs B).
+    This is done per-simulation, so play-in uncertainty is reflected in outcomes.
+    """
+    resolved: dict = {}
+    for region, matchups in bracket.items():
+        new_matchups = []
+        for team, seed in matchups:
+            if _is_play_in_team(team):
+                a, b = _split_play_in(team)
+                winner = simulate_game(a, b, rng)
+                new_matchups.append((winner, seed))
+            else:
+                new_matchups.append((team, seed))
+        resolved[region] = new_matchups
+    return resolved
+
+def simulate_tournament(bracket_data, num_simulations=1000000, *, rng: np.random.Generator, progress_every: int = 0):
     """Simulate the entire tournament multiple times."""
     results = {
         'championship_wins': defaultdict(int),
@@ -177,36 +222,36 @@ def simulate_tournament(bracket_data, num_simulations=1000000): #Running 1,000,0
     }
     
     for sim in range(num_simulations):
-        if sim % 100 == 0:  # Progress indicator
+        if progress_every and sim % progress_every == 0:
             print(f"Running simulation {sim}/{num_simulations}")
             
-        current_bracket = {region: matchups[:] for region, matchups in bracket_data.items()}
+        current_bracket = resolve_first_four(bracket_data, rng)
         final_four = []
         
         for region in current_bracket:
             # Round of 32
-            current_bracket[region] = simulate_round(current_bracket[region])
+            current_bracket[region] = simulate_round(current_bracket[region], rng)
             for team, _ in current_bracket[region]:
                 results['round_32'][team] += 1
             
             # Sweet 16
-            current_bracket[region] = simulate_round(current_bracket[region])
+            current_bracket[region] = simulate_round(current_bracket[region], rng)
             for team, _ in current_bracket[region]:
                 results['sweet_sixteen'][team] += 1
             
             # Elite 8
-            current_bracket[region] = simulate_round(current_bracket[region])
+            current_bracket[region] = simulate_round(current_bracket[region], rng)
             for team, _ in current_bracket[region]:
                 results['elite_eight'][team] += 1
             
             # Final 4
-            regional_winner = simulate_round(current_bracket[region])[0]
+            regional_winner = simulate_round(current_bracket[region], rng)[0]
             final_four.append(regional_winner)
             results['final_four'][regional_winner[0]] += 1
         
         # Championship
-        championship_game = simulate_round(final_four)
-        champion = simulate_round(championship_game)[0][0]
+        championship_game = simulate_round(final_four, rng)
+        champion = simulate_round(championship_game, rng)[0][0]
         results['championship_wins'][champion] += 1
     
     return results
@@ -334,18 +379,24 @@ def _ensure_team_tempo_stats(bracket: dict) -> dict[str, dict[str, float]]:
     """
     tempo_stats: dict[str, dict[str, float]] = {}
     for team, seed in _iter_bracket_teams(bracket):
-        overall, off_eff, def_eff, _, _ = team_stats[team]
-        tempo = 66.0 + (overall - 70.0) * 0.15 + (8 - seed) * 0.05
-        tempo_stats[team] = {
-            "offense": float(np.clip(off_eff + (overall - 75.0) * 0.15, 98.0, 128.0)),
-            "defense": float(np.clip(def_eff - (overall - 75.0) * 0.10, 85.0, 112.0)),
-            "tempo": float(np.clip(tempo, 61.0, 74.0)),
-        }
+        # For play-in placeholders, store stats for the underlying teams too.
+        teams_to_add = [team]
+        if _is_play_in_team(team):
+            teams_to_add = list(_split_play_in(team))
+
+        for t in teams_to_add:
+            overall, off_eff, def_eff, _, _ = team_stats[t]
+            tempo = 66.0 + (overall - 70.0) * 0.12 + (8 - seed) * 0.04
+            tempo_stats[t] = {
+                "offense": float(np.clip(off_eff, 98.0, 126.0)),
+                "defense": float(np.clip(def_eff, 85.0, 112.0)),
+                "tempo": float(np.clip(tempo, 62.0, 72.0)),
+            }
     return tempo_stats
 
 team_tempo_stats = _ensure_team_tempo_stats(bracket_data)
 
-def predict_game_score(team1, team2):
+def predict_game_score(team1, team2, rng: np.random.Generator):
     """Predict the score for a game between two teams"""
     if team1 not in team_tempo_stats or team2 not in team_tempo_stats:
         raise ValueError(f"Missing stats for {team1} or {team2}")
@@ -366,16 +417,16 @@ def predict_game_score(team1, team2):
     team2_base = team2_ppp * possessions
     
     # Add random variation
-    team1_score = round(team1_base + np.random.normal(0, 4))
-    team2_score = round(team2_base + np.random.normal(0, 4))
+    team1_score = round(team1_base + rng.normal(0, 3.5))
+    team2_score = round(team2_base + rng.normal(0, 3.5))
     
     # Ensure reasonable scores
-    team1_score = max(55, min(95, team1_score))
-    team2_score = max(55, min(95, team2_score))
+    team1_score = max(40, min(105, team1_score))
+    team2_score = max(40, min(105, team2_score))
     
     return team1_score, team2_score
 
-def analyze_championship_scoring(final_four_teams):
+def analyze_championship_scoring(final_four_teams, rng: np.random.Generator, *, sims_per_matchup: int = 1000):
     """Analyze potential scoring outcomes for all possible championship matchups"""
     print("\n=== Championship Game Scoring Analysis ===")
     
@@ -393,8 +444,8 @@ def analyze_championship_scoring(final_four_teams):
         print("-" * 40)
         
         scores = []
-        for _ in range(1000):  # Simulate each matchup 1000 times
-            score1, score2 = predict_game_score(team1, team2)
+        for _ in range(sims_per_matchup):
+            score1, score2 = predict_game_score(team1, team2, rng)
             scores.append((score1, score2))
         
         # Calculate statistics
@@ -411,7 +462,7 @@ def analyze_championship_scoring(final_four_teams):
         print(f"Average Total: {avg_total:.1f}")
         print("\nMost Likely Scores:")
         for score, count in score_counter.most_common(3):
-            percentage = (count/1000) * 100
+            percentage = (count / sims_per_matchup) * 100
             print(f"{score[0]}-{score[1]}: {percentage:.1f}%")
         
         # Calculate over/under probabilities
@@ -421,21 +472,37 @@ def analyze_championship_scoring(final_four_teams):
             print(f"Over {points}: {over_prob:.1f}%")
 
 if __name__ == "__main__":
-    num_simulations = 1_000_000
+    parser = argparse.ArgumentParser(description="March Madness 2026 tournament simulator")
+    parser.add_argument("--num-simulations", type=int, default=1_000_000, help="Number of tournament simulations")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible runs")
+    parser.add_argument("--progress-every", type=int, default=0, help="Print progress every N simulations (0 = off)")
+    parser.add_argument("--no-scoring", action="store_true", help="Skip championship scoring analysis")
+    parser.add_argument("--score-sims", type=int, default=1000, help="Simulations per matchup in scoring analysis")
+    args = parser.parse_args()
+
+    validate_bracket(bracket_data)
+
+    rng = np.random.default_rng(args.seed)
     print("Running 2026 tournament simulations...")
-    simulation_results = simulate_tournament(bracket_data, num_simulations=num_simulations)
-    print_results(simulation_results, num_simulations)
+    simulation_results = simulate_tournament(
+        bracket_data,
+        num_simulations=args.num_simulations,
+        rng=rng,
+        progress_every=args.progress_every,
+    )
+    print_results(simulation_results, args.num_simulations)
     print_bracket_predictions(simulation_results, bracket_data)
 
-    # Get Final Four teams (most frequent by region) and analyze scoring
-    final_four_teams = []
-    for region in ["South", "West", "East", "Midwest"]:
-        teams_in_region = [
-            (team, count)
-            for team, count in simulation_results["final_four"].items()
-            if team in [t[0] for t in bracket_data[region]]
-        ]
-        if teams_in_region:
-            top_team = max(teams_in_region, key=lambda x: x[1])
-            final_four_teams.append((top_team[0], None))
-    analyze_championship_scoring(final_four_teams)
+    if not args.no_scoring:
+        # Get Final Four teams (most frequent by region) and analyze scoring
+        final_four_teams = []
+        for region in ["South", "West", "East", "Midwest"]:
+            teams_in_region = [
+                (team, count)
+                for team, count in simulation_results["final_four"].items()
+                if team in [t[0] for t in bracket_data[region]]
+            ]
+            if teams_in_region:
+                top_team = max(teams_in_region, key=lambda x: x[1])
+                final_four_teams.append((top_team[0], None))
+        analyze_championship_scoring(final_four_teams, rng, sims_per_matchup=args.score_sims)
