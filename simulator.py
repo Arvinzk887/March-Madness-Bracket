@@ -1,6 +1,483 @@
 import argparse
+import hashlib
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Backtest foundation (historical calibration)
+# ---------------------------------------------------------------------------
+# Intended flow once historical data is available:
+#   config = BacktestConfig(season="2024", bracket=load_historical_bracket(2024), ...)
+#   predicted = run_backtest(config, num_simulations=100_000, rng=rng)
+#   actual = load_historical_results(2024)
+#   metrics = evaluate_backtest(predicted, actual, num_simulations)
+#   # Compare: champion_correct, final_four_hit_rate, upset calibration
+#
+# TODO: Add load_historical_bracket(year) -> dict
+# TODO: Add load_historical_ratings(year) -> dict[str, float]
+# TODO: Add load_historical_results(year) -> HistoricalResults
+
+
+@dataclass
+class BacktestConfig:
+    """
+    Configuration for running the simulator on a specific season.
+
+    Swap in historical bracket and ratings to backtest model calibration.
+    """
+    season: str  # e.g. "2024", "2025"
+    bracket: dict[str, list[tuple[str, int]]]
+    overall_overrides: dict[str, float]
+    metrics_overrides: dict[str, dict[str, Any]] | None = None
+
+    # TODO: Load from CSV/JSON, e.g.:
+    #   config = BacktestConfig(
+    #       season="2024",
+    #       bracket=load_historical_bracket(2024),
+    #       overall_overrides=load_historical_ratings(2024),
+    #       metrics_overrides=load_historical_metrics(2024),
+    #   )
+
+
+@dataclass
+class HistoricalResults:
+    """
+    Actual tournament outcomes for a season. Used to evaluate predictions.
+
+    TODO: Populate from historical data (Wikipedia, NCAA, etc.).
+    """
+
+    season: str
+    champion: str
+    final_four: list[str]
+    # TODO: Add elite_eight, sweet_sixteen, round_of_32 for finer evaluation
+    # TODO: Add first_round_upsets: list[tuple[str, str]]  # (winner, loser) for upset calibration
+
+
+def run_backtest(
+    config: BacktestConfig,
+    num_simulations: int = 100_000,
+    rng: np.random.Generator | None = None,
+) -> dict:
+    """
+    Run the simulator on a backtest config (historical bracket + ratings).
+
+    Returns the same structure as simulate_tournament for evaluation.
+    """
+    rng = rng or np.random.default_rng()
+    registry = build_team_metrics_registry(
+        config.bracket,
+        overall_overrides=config.overall_overrides,
+        metrics_overrides=config.metrics_overrides,
+    )
+    local_team_stats = {name: m.to_win_factors() for name, m in registry.items()}
+
+    return simulate_tournament(
+        config.bracket,
+        num_simulations=num_simulations,
+        rng=rng,
+        progress_every=0,
+        _team_stats=local_team_stats,
+        _bracket=config.bracket,
+    )
+
+
+def evaluate_backtest(
+    predicted: dict,
+    actual: HistoricalResults,
+    num_simulations: int,
+) -> dict[str, Any]:
+    """
+    Compare predicted results to actual outcomes.
+
+    Returns metrics for:
+    - champion_pick_quality: did top-predicted champion match actual?
+    - final_four_hit_rate: how many actual Final Four teams were in top-4 predicted?
+    - upset_calibration: TODO - compare predicted upset probs to actual upset rates by seed
+    """
+    # Predicted champion = most frequent in championship_wins
+    pred_champion = max(predicted["championship_wins"].items(), key=lambda x: x[1])[0]
+    champion_correct = pred_champion == actual.champion
+
+    # Predicted Final Four = top 4 by final_four count
+    pred_ff = sorted(
+        predicted["final_four"].items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:4]
+    pred_ff_teams = {t for t, _ in pred_ff}
+    actual_ff_set = set(actual.final_four)
+    final_four_hits = len(pred_ff_teams & actual_ff_set)
+    final_four_hit_rate = final_four_hits / 4.0 if len(actual_ff_set) == 4 else 0.0
+
+    # TODO: Upset calibration by seed
+    #   - For each seed matchup (1v16, 2v15, ...), compare predicted higher-seed win %
+    #     to actual historical win rate. Requires first_round_upsets in HistoricalResults.
+
+    return {
+        "champion_correct": champion_correct,
+        "predicted_champion": pred_champion,
+        "actual_champion": actual.champion,
+        "final_four_hits": final_four_hits,
+        "final_four_hit_rate": final_four_hit_rate,
+        "predicted_final_four": list(pred_ff_teams),
+        "actual_final_four": actual.final_four,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bracket pool expected value (optional)
+# ---------------------------------------------------------------------------
+# Optimizes for pool scoring, not raw prediction accuracy.
+# Extensible: custom round scoring, contrarian pick value, chalk vs variance.
+
+
+@dataclass
+class BracketPoolConfig:
+    """
+    Scoring rules for a bracket pool. Points per correct pick by round.
+
+    Default mimics common pools (1-2-4-8-16-32). Override for custom formats.
+    """
+    round_64: int = 1
+    round_32: int = 2
+    sweet_16: int = 4
+    elite_8: int = 8
+    final_four: int = 16
+    championship: int = 32
+
+    def points_for_round(self, round_key: str) -> int:
+        """Round key: 'round_32'|'sweet_sixteen'|'elite_eight'|'final_four'|'championship_wins'."""
+        mapping = {
+            "round_32": self.round_64,  # R64 winners advance to R32
+            "sweet_sixteen": self.round_32,
+            "elite_eight": self.sweet_16,
+            "final_four": self.elite_8,
+            "championship_wins": self.championship,
+        }
+        return mapping.get(round_key, 0)
+
+
+def _build_first_round_matchups(bracket: dict) -> list[tuple[str, str]]:
+    """
+    Build the 32 first-round matchups from the bracket.
+    Returns [(team_a, team_b), ...] for each game.
+    """
+    games = []
+    for region, teams in bracket.items():
+        matchups = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15)]
+        for i, j in matchups:
+            t1, t2 = teams[i][0], teams[j][0]
+            games.append((t1, t2))
+    return games
+
+
+def expected_bracket_score_r64(
+    simulation_results: dict,
+    num_simulations: int,
+    bracket: dict,
+    pool_config: BracketPoolConfig,
+    picks: dict[tuple[str, str], str] | None = None,
+) -> float:
+    """
+    Expected pool score for first-round (R64) picks only.
+
+    picks: optional {(team_a, team_b): winner} for each game. When None, uses chalk
+    (most likely winner from round_32 advancement counts).
+
+    Extensible: add expected_bracket_score_full() for R32–Champ once bracket
+    resolution is implemented.
+    """
+    n = num_simulations
+    r32 = simulation_results["round_32"]
+    games = _build_first_round_matchups(bracket)
+    ev = 0.0
+
+    for t1, t2 in games:
+        c1, c2 = r32.get(t1, 0), r32.get(t2, 0)
+        p1 = c1 / n if n else 0
+        p2 = c2 / n if n else 0
+
+        if picks is not None and (t1, t2) in picks:
+            winner = picks[(t1, t2)]
+            prob = p1 if winner == t1 else p2
+        else:
+            # Chalk: pick higher probability
+            prob = max(p1, p2)
+
+        ev += prob * pool_config.round_64
+
+    return ev
+
+
+def compare_chalk_vs_contrarian(
+    simulation_results: dict,
+    num_simulations: int,
+    bracket: dict,
+    pool_config: BracketPoolConfig | None = None,
+    upset_game: tuple[str, str] | None = None,
+) -> dict[str, float]:
+    """
+    Proof-of-concept: compare expected R64 score for chalk vs one contrarian pick.
+
+    upset_game: (favorite, underdog) - pick underdog in this game, chalk elsewhere.
+    If None, picks the first 12v5 upset by seed (if present in bracket).
+    """
+    pool_config = pool_config or BracketPoolConfig()
+    games = _build_first_round_matchups(bracket)
+
+    chalk_ev = expected_bracket_score_r64(
+        simulation_results, num_simulations, bracket, pool_config, picks=None
+    )
+
+    if upset_game is None:
+        # Find a 12v5 game (5-seed favorite, 12-seed underdog)
+        seed_index = _build_seed_index(bracket)
+        for t1, t2 in games:
+            s1, s2 = seed_index.get(t1, 99), seed_index.get(t2, 99)
+            if (s1, s2) in [(5, 12), (12, 5)]:
+                favorite = t1 if s1 < s2 else t2
+                underdog = t2 if s1 < s2 else t1
+                upset_game = (favorite, underdog)
+                break
+        if upset_game is None:
+            return {"chalk_ev": chalk_ev, "contrarian_ev": chalk_ev, "contrarian_game": None}
+
+    fav, underdog = upset_game
+    picks = {}
+    for t1, t2 in games:
+        if (t1, t2) == (fav, underdog) or (t1, t2) == (underdog, fav):
+            picks[(t1, t2)] = underdog
+        else:
+            r32 = simulation_results["round_32"]
+            c1, c2 = r32.get(t1, 0), r32.get(t2, 0)
+            picks[(t1, t2)] = t1 if c1 >= c2 else t2
+
+    contrarian_ev = expected_bracket_score_r64(
+        simulation_results, num_simulations, bracket, pool_config, picks=picks
+    )
+
+    return {
+        "chalk_ev": chalk_ev,
+        "contrarian_ev": contrarian_ev,
+        "contrarian_game": upset_game,
+    }
+
+
+def _team_advance_prob(team: str, r32: dict, n: int) -> float:
+    """P(team advances to R32). Handles play-in by summing both constituent teams."""
+    if _is_play_in_team(team):
+        a, b = _split_play_in(team)
+        return (r32.get(a, 0) + r32.get(b, 0)) / n if n else 0
+    return r32.get(team, 0) / n if n else 0
+
+
+def _build_chalk_picks(
+    simulation_results: dict,
+    num_simulations: int,
+    bracket: dict,
+) -> dict[tuple[str, str], str]:
+    """Build chalk picks: {(t1, t2): winner} for each R64 game."""
+    r32 = simulation_results["round_32"]
+    n = num_simulations
+    games = _build_first_round_matchups(bracket)
+    picks = {}
+    for t1, t2 in games:
+        p1 = _team_advance_prob(t1, r32, n)
+        p2 = _team_advance_prob(t2, r32, n)
+        picks[(t1, t2)] = t1 if p1 >= p2 else t2
+    return picks
+
+
+def _build_picks_with_upsets(
+    chalk_picks: dict[tuple[str, str], str],
+    upset_games: list[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Take chalk picks and flip specified games to underdog. upset_games: [(fav, underdog), ...]."""
+    picks = dict(chalk_picks)
+    for fav, underdog in upset_games:
+        for (t1, t2) in list(picks.keys()):
+            if (t1, t2) == (fav, underdog) or (t1, t2) == (underdog, fav):
+                picks[(t1, t2)] = underdog
+                break
+    return picks
+
+
+def rank_single_upset_swaps(
+    simulation_results: dict,
+    num_simulations: int,
+    bracket: dict,
+    pool_config: BracketPoolConfig,
+    seed_index: dict[str, int] | None = None,
+    top_n: int = 10,
+) -> list[tuple[tuple[str, str], float, float, tuple[int, int]]]:
+    """
+    Rank R64 games by EV impact of picking underdog instead of chalk.
+
+    Returns list of (game, ev_with_upset, ev_change, (hi_seed, lo_seed)) sorted by
+    ev_change descending (least-bad upsets first). top_n limits results.
+    """
+    r32 = simulation_results["round_32"]
+    n = num_simulations
+    games = _build_first_round_matchups(bracket)
+    seed_idx = seed_index or _build_seed_index(bracket)
+    pts = pool_config.round_64
+
+    chalk_picks = _build_chalk_picks(simulation_results, n, bracket)
+    chalk_ev = expected_bracket_score_r64(
+        simulation_results, n, bracket, pool_config, picks=chalk_picks
+    )
+
+    swaps = []
+    for t1, t2 in games:
+        p1 = _team_advance_prob(t1, r32, n)
+        p2 = _team_advance_prob(t2, r32, n)
+        fav = t1 if p1 >= p2 else t2
+        underdog = t2 if p1 >= p2 else t1
+        p_fav = max(p1, p2)
+        p_underdog = min(p1, p2)
+
+        # Only consider true upsets (underdog has lower prob)
+        if p_underdog >= p_fav:
+            continue
+
+        picks_upset = _build_picks_with_upsets(chalk_picks, [(fav, underdog)])
+        ev_upset = expected_bracket_score_r64(
+            simulation_results, n, bracket, pool_config, picks=picks_upset
+        )
+        ev_change = ev_upset - chalk_ev  # negative; we want least negative
+
+        s1 = seed_idx.get(_split_play_in(t1)[0] if _is_play_in_team(t1) else t1, 99)
+        s2 = seed_idx.get(_split_play_in(t2)[0] if _is_play_in_team(t2) else t2, 99)
+        hi_seed, lo_seed = (s1, s2) if s1 < s2 else (s2, s1)
+
+        swaps.append(((fav, underdog), ev_upset, ev_change, (hi_seed, lo_seed)))
+
+    swaps.sort(key=lambda x: -x[2])  # highest ev_change first (least bad)
+    return swaps[:top_n]
+
+
+def compare_bracket_variants(
+    simulation_results: dict,
+    num_simulations: int,
+    bracket: dict,
+    pool_config: BracketPoolConfig | None = None,
+) -> dict[str, float]:
+    """
+    Compare expected R64 scores for chalk, light, medium, and high variance brackets.
+
+    - pure chalk: all favorites
+    - light contrarian: 1 upset (best single swap by EV)
+    - medium contrarian: top 3 upsets
+    - high variance: top 5 upsets
+    """
+    pool_config = pool_config or BracketPoolConfig()
+    chalk_picks = _build_chalk_picks(simulation_results, num_simulations, bracket)
+    ranked = rank_single_upset_swaps(
+        simulation_results, num_simulations, bracket, pool_config, top_n=10
+    )
+
+    results = {}
+    # Pure chalk
+    results["chalk"] = expected_bracket_score_r64(
+        simulation_results, num_simulations, bracket, pool_config, picks=chalk_picks
+    )
+
+    # Light: 1 best upset
+    if ranked:
+        light_picks = _build_picks_with_upsets(chalk_picks, [ranked[0][0]])
+        results["light_contrarian"] = expected_bracket_score_r64(
+            simulation_results, num_simulations, bracket, pool_config, picks=light_picks
+        )
+    else:
+        results["light_contrarian"] = results["chalk"]
+
+    # Medium: top 3 upsets
+    if len(ranked) >= 3:
+        medium_picks = _build_picks_with_upsets(chalk_picks, [r[0] for r in ranked[:3]])
+        results["medium_contrarian"] = expected_bracket_score_r64(
+            simulation_results, num_simulations, bracket, pool_config, picks=medium_picks
+        )
+    elif ranked:
+        results["medium_contrarian"] = results["light_contrarian"]
+    else:
+        results["medium_contrarian"] = results["chalk"]
+
+    # High variance: top 5 upsets
+    if len(ranked) >= 5:
+        high_picks = _build_picks_with_upsets(chalk_picks, [r[0] for r in ranked[:5]])
+        results["high_variance"] = expected_bracket_score_r64(
+            simulation_results, num_simulations, bracket, pool_config, picks=high_picks
+        )
+    elif ranked:
+        results["high_variance"] = results["medium_contrarian"]
+    else:
+        results["high_variance"] = results["chalk"]
+
+    return results
+
+
 from collections import defaultdict
+
+
+# ---------------------------------------------------------------------------
+# Team metrics data structure
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TeamMetrics:
+    """
+    Canonical team input for the simulation model.
+
+    All fields are used by win-probability and/or score-prediction logic.
+    Replace fallback-generated values with real data (e.g. KenPom, custom CSV)
+    by passing a metrics_overrides dict to build_team_metrics_registry().
+    """
+    name: str
+    seed: int
+    overall: float
+    offensive_efficiency: float
+    defensive_efficiency: float
+    tempo: float
+    experience: float
+    coaching: float
+
+    def to_win_factors(self) -> list[float]:
+        """[overall, offense, defense, experience, coach] for calculate_win_probability."""
+        return [
+            self.overall,
+            self.offensive_efficiency,
+            self.defensive_efficiency,
+            self.experience,
+            self.coaching,
+        ]
+
+    def to_tempo_dict(self) -> dict[str, float]:
+        """{offense, defense, tempo} for predict_game_score."""
+        return {
+            "offense": float(np.clip(self.offensive_efficiency, 98.0, 126.0)),
+            "defense": float(np.clip(self.defensive_efficiency, 85.0, 112.0)),
+            "tempo": float(np.clip(self.tempo, 62.0, 72.0)),
+        }
+
+    @classmethod
+    def from_dict(cls, name: str, seed: int, d: dict[str, Any]) -> "TeamMetrics":
+        """
+        Build from a dict (e.g. CSV row or JSON). Missing keys use defaults.
+        Use this when loading real data from external sources.
+        """
+        return cls(
+            name=name,
+            seed=seed,
+            overall=float(d.get("overall", 75.0)),
+            offensive_efficiency=float(d.get("offensive_efficiency", d.get("offense", 105.0))),
+            defensive_efficiency=float(d.get("defensive_efficiency", d.get("defense", 100.0))),
+            tempo=float(d.get("tempo", 67.0)),
+            experience=float(d.get("experience", 6.5)),
+            coaching=float(d.get("coaching", 6.5)),
+        )
 
 # 2026 NCAA Tournament bracket data (official first-round matchups)
 bracket_data = {
@@ -95,86 +572,273 @@ def _iter_bracket_teams(bracket: dict) -> list[tuple[str, int]]:
             teams.append((team, seed))
     return teams
 
-def _ensure_team_factors(bracket: dict) -> dict[str, list[float]]:
+def _team_seed_from_name(name: str) -> int:
     """
-    Returns per-team factors:
-      [overall, offense_eff, defense_eff, experience, coach]
-    Ensures all teams in the bracket have entries, using `team_ratings` + seed defaults.
+    Stable, deterministic seed derived from team name.
+
+    This lets us generate synthetic attributes that are:
+    - reproducible across runs
+    - different across teams
     """
-    factors: dict[str, list[float]] = {}
+    h = hashlib.md5(name.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
+
+def _build_fallback_metrics(team: str, seed: int, overall_override: float | None = None) -> TeamMetrics:
+    """
+    Generate synthetic TeamMetrics when real data is unavailable.
+
+    Uses deterministic per-team variation so similar overall ratings can still
+    differ in offense/defense profile, experience, and coaching.
+    """
+    base_overall = float(overall_override if overall_override is not None else _seed_based_overall(seed))
+    rng = np.random.default_rng(_team_seed_from_name(team))
+
+    style = rng.normal(0.0, 0.7)
+    off_base = 100.0 + (base_overall - 70.0) * 0.8
+    def_base = 105.0 - (base_overall - 70.0) * 0.6
+    off_eff = float(np.clip(off_base + style * 3.0 + rng.normal(0.0, 2.0), 100.0, 125.0))
+    def_eff = float(np.clip(def_base - style * 2.5 + rng.normal(0.0, 2.0), 88.0, 112.0))
+
+    exp_base = 6.3 + (8 - min(seed, 16)) * 0.08
+    experience = float(np.clip(exp_base + rng.normal(0.0, 0.7), 4.0, 9.5))
+
+    coach_base = 6.0 + (base_overall - 75.0) / 12.0
+    coaching = float(np.clip(coach_base + rng.normal(0.0, 0.6), 4.0, 9.5))
+
+    tempo = 66.0 + (base_overall - 70.0) * 0.12 + (8 - seed) * 0.04
+    tempo = float(np.clip(tempo, 62.0, 72.0))
+
+    return TeamMetrics(
+        name=team,
+        seed=seed,
+        overall=base_overall,
+        offensive_efficiency=off_eff,
+        defensive_efficiency=def_eff,
+        tempo=tempo,
+        experience=experience,
+        coaching=coaching,
+    )
+
+
+def build_team_metrics_registry(
+    bracket: dict,
+    *,
+    overall_overrides: dict[str, float] | None = None,
+    metrics_overrides: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, TeamMetrics]:
+    """
+    Build the canonical team metrics registry from bracket + optional overrides.
+
+    - overall_overrides: team_name -> overall rating (e.g. team_ratings). Used when
+      generating fallback metrics.
+    - metrics_overrides: team_name -> full metrics dict. When present, uses
+      TeamMetrics.from_dict() instead of fallback. Use this to inject real data
+      from CSV, KenPom, etc.
+
+    Example for future real data (CSV/dict):
+        import csv
+        overrides = {}
+        with open("kenpom_2026.csv") as f:
+            for row in csv.DictReader(f):
+                overrides[row["team"]] = {
+                    "overall": float(row["rating"]),
+                    "offensive_efficiency": float(row["adj_o"]),
+                    "defensive_efficiency": float(row["adj_d"]),
+                    "tempo": float(row["tempo"]),
+                    "experience": 6.5,  # if not in CSV
+                    "coaching": 6.5,
+                }
+        registry = build_team_metrics_registry(bracket_data, metrics_overrides=overrides)
+    """
+    overall_overrides = overall_overrides or {}
+    metrics_overrides = metrics_overrides or {}
+    registry: dict[str, TeamMetrics] = {}
 
     for team, seed in _iter_bracket_teams(bracket):
-        # If this is a play-in placeholder (e.g., "A/B"), ensure *both* A and B get stats.
         teams_to_add = [team]
         if _is_play_in_team(team):
             teams_to_add = list(_split_play_in(team))
 
         for t in teams_to_add:
-            base_overall = float(team_ratings.get(t, _seed_based_overall(seed)))
-            offense = 98.0 + (base_overall - 50.0) * 0.55
-            defense = 110.0 - (base_overall - 50.0) * 0.45  # lower is better
-            experience = 6.0 + (base_overall - 70.0) / 20.0
-            coach = 6.0 + (base_overall - 70.0) / 25.0
+            if t in registry:
+                continue
+            if t in metrics_overrides:
+                registry[t] = TeamMetrics.from_dict(t, seed, metrics_overrides[t])
+            else:
+                registry[t] = _build_fallback_metrics(t, seed, overall_overrides.get(t))
 
-            factors[t] = [
-                base_overall,
-                float(np.clip(offense, 95.0, 125.0)),
-                float(np.clip(defense, 85.0, 115.0)),
-                float(np.clip(experience, 4.0, 9.5)),
-                float(np.clip(coach, 4.0, 9.5)),
-            ]
+    return registry
 
-    return factors
 
-team_stats = _ensure_team_factors(bracket_data)
+# Build registry from bracket + team_ratings. Pass metrics_overrides for real data.
+team_metrics_registry = build_team_metrics_registry(bracket_data, overall_overrides=team_ratings)
 
-def calculate_win_probability(team1, team2):
-    """Calculate win probability using multiple factors"""
-    stats1 = team_stats[team1]
-    stats2 = team_stats[team2]
-    
-    # Weights for different factors
-    weights = {
-        'overall': 0.4,
-        'offense': 0.2,
-        'defense': 0.2,
-        'experience': 0.1,
-        'coach': 0.1
-    }
-    
-    # Calculate weighted score for each team
-    score1 = (
-        weights['overall'] * stats1[0] +
-        weights['offense'] * (stats1[1]/120) * 100 +
-        weights['defense'] * (1 - stats1[2]/120) * 100 +
-        weights['experience'] * stats1[3] * 10 +
-        weights['coach'] * stats1[4] * 10
+# Backward-compatible views (used by calculate_win_probability and predict_game_score)
+team_stats = {name: m.to_win_factors() for name, m in team_metrics_registry.items()}
+team_tempo_stats = {name: m.to_tempo_dict() for name, m in team_metrics_registry.items()}
+
+# Win-probability calibration constants.
+# Tune to balance chalk vs upsets: reduce overall / SEED_EDGE for more upsets.
+WIN_WEIGHTS = {
+    "overall": 0.48,   # was 0.55; lower reduces favorite dominance
+    "offense": 0.20,
+    "defense": 0.19,
+    "experience": 0.06,
+    "coach": 0.07,
+}
+
+# Logistic scale: larger → flatter curve → more upsets. Smaller → more chalk.
+LOGISTIC_SCALE = 14.0  # was 12.0; modest increase for realistic early-round upset frequency
+
+# Seed-based nudge: better seeds get a small bump. Lower = less chalk amplification.
+SEED_EDGE_STRENGTH = 0.65  # was 0.8; reduced to avoid over-amplifying favorites, but keep 1v16 strong
+
+def _composite_rating(stats: list[float]) -> float:
+    """
+    Map raw team factors -> a single composite rating.
+
+    This keeps the combination logic explicit and easy to tune.
+    """
+    overall, off_eff, def_eff, exp, coach = stats
+
+    # Normalise offense/defense into rough 0–1 scales.
+    off_component = (off_eff - 105.0) / 12.0  # ~[-1, +1] for typical teams
+    def_component = (100.0 - def_eff) / 10.0  # better defense → larger positive
+
+    exp_component = (exp - 6.5) / 3.0
+    coach_component = (coach - 6.5) / 3.0
+
+    rating = (
+        WIN_WEIGHTS["overall"] * overall
+        + WIN_WEIGHTS["offense"] * off_component * 10.0
+        + WIN_WEIGHTS["defense"] * def_component * 10.0
+        + WIN_WEIGHTS["experience"] * exp_component * 10.0
+        + WIN_WEIGHTS["coach"] * coach_component * 10.0
     )
-    
-    score2 = (
-        weights['overall'] * stats2[0] +
-        weights['offense'] * (stats2[1]/120) * 100 +
-        weights['defense'] * (1 - stats2[2]/120) * 100 +
-        weights['experience'] * stats2[3] * 10 +
-        weights['coach'] * stats2[4] * 10
-    )
-    
-    # Calculate win probability using logistic function
-    diff = score1 - score2
-    return 1 / (1 + np.exp(-diff / 15))
+    return rating
 
-def simulate_game(team1, team2, rng: np.random.Generator):
+def calculate_win_probability(
+    team1: str,
+    team2: str,
+    _team_stats: dict[str, list[float]] | None = None,
+    _bracket: dict | None = None,
+) -> float:
+    """
+    Calculate win probability using team factors and a logistic model.
+
+    Tuning notes:
+    - Increase LOGISTIC_SCALE to make matchups flatter (more upsets).
+    - Decrease LOGISTIC_SCALE to make ratings more decisive (more chalk).
+
+    _team_stats, _bracket: optional overrides for backtesting; when None, use globals.
+    """
+    stats_src = _team_stats if _team_stats is not None else team_stats
+    bracket_src = _bracket if _bracket is not None else bracket_data
+
+    stats1 = stats_src[team1]
+    stats2 = stats_src[team2]
+
+    rating1 = _composite_rating(stats1)
+    rating2 = _composite_rating(stats2)
+
+    # Optional small seed-based nudge: better seeds get a *tiny* bump,
+    # but this should never dominate the actual rating.
+    seed1 = seed2 = None
+    for region, matchups in bracket_src.items():
+        for name, seed in matchups:
+            if name == team1:
+                seed1 = seed
+            if name == team2:
+                seed2 = seed
+        if seed1 is not None and seed2 is not None:
+            break
+
+    if seed1 is not None and seed2 is not None:
+        seed_edge = (seed2 - seed1) * SEED_EDGE_STRENGTH
+    else:
+        seed_edge = 0.0
+
+    rating_diff = rating1 - rating2 + seed_edge
+
+    # Logistic transform into (0,1). Centered at 0 → 50/50.
+    x = rating_diff / LOGISTIC_SCALE
+    prob = 1.0 / (1.0 + np.exp(-x))
+
+    # Guard against exact 0 or 1 from extreme diffs / numeric limits.
+    return float(np.clip(prob, 1e-4, 1.0 - 1e-4))
+
+def print_seed_matchup_diagnostics(bracket: dict | None = None):
+    """
+    Lightweight calibration helper: prints implied upset probabilities for
+    common seed matchups (1v16, 2v15, ..., 8v9) using current parameters.
+
+    bracket: optional override; when None, uses bracket_data.
+    """
+    br = bracket if bracket is not None else bracket_data
+    pairs = [
+        (1, 16),
+        (2, 15),
+        (3, 14),
+        (4, 13),
+        (5, 12),
+        (6, 11),
+        (7, 10),
+        (8, 9),
+    ]
+
+    # Build a reverse index: (seed, region) -> team name, choosing a
+    # representative team for that seed in that region.
+    seed_index: dict[tuple[int, str], str] = {}
+    for region, teams in br.items():
+        for name, seed in teams:
+            key = (seed, region)
+            if key not in seed_index:
+                # If this is a play-in placeholder, take the first named team
+                # as a representative for diagnostics.
+                if _is_play_in_team(name):
+                    rep, _ = _split_play_in(name)
+                    seed_index[key] = rep
+                else:
+                    seed_index[key] = name
+
+    regions = ["South", "West", "East", "Midwest"]
+
+    print("\nSeed matchup diagnostics (prob = higher-seed win probability):")
+    for hi, lo in pairs:
+        probs = []
+        for region in regions:
+            hi_team = seed_index.get((hi, region))
+            lo_team = seed_index.get((lo, region))
+            if hi_team and lo_team:
+                p = calculate_win_probability(hi_team, lo_team, _bracket=br)
+                probs.append(p)
+        if probs:
+            avg = sum(probs) / len(probs)
+            print(f"{hi} vs {lo}: avg higher-seed win prob ≈ {avg:.3f} over {len(probs)} region(s)")
+
+def simulate_game(
+    team1: str,
+    team2: str,
+    rng: np.random.Generator,
+    _team_stats: dict[str, list[float]] | None = None,
+    _bracket: dict | None = None,
+) -> str:
     """Simulate a single game between two teams."""
-    prob_team1 = calculate_win_probability(team1, team2)
+    prob_team1 = calculate_win_probability(team1, team2, _team_stats=_team_stats, _bracket=_bracket)
     return team1 if rng.random() < prob_team1 else team2
 
-def simulate_round(matchups, rng: np.random.Generator):
+def simulate_round(
+    matchups: list[tuple[str, int]],
+    rng: np.random.Generator,
+    _team_stats: dict[str, list[float]] | None = None,
+    _bracket: dict | None = None,
+) -> list[tuple[str, int]]:
     """Simulate one round of games."""
     winners = []
     for i in range(0, len(matchups), 2):
         team1, seed1 = matchups[i]
         team2, seed2 = matchups[i + 1]
-        winner = simulate_game(team1, team2, rng)
+        winner = simulate_game(team1, team2, rng, _team_stats=_team_stats, _bracket=_bracket)
         winner_seed = seed1 if winner == team1 else seed2
         winners.append((winner, winner_seed))
     return winners
@@ -193,7 +857,12 @@ def validate_bracket(bracket: dict) -> None:
         if set(seeds) != set(range(1, 17)):
             raise ValueError(f"{region} seeds must be 1-16 exactly once; got {sorted(seeds)}")
 
-def resolve_first_four(bracket: dict, rng: np.random.Generator) -> dict:
+def resolve_first_four(
+    bracket: dict,
+    rng: np.random.Generator,
+    _team_stats: dict[str, list[float]] | None = None,
+    _bracket: dict | None = None,
+) -> dict:
     """
     Replace any play-in placeholders like 'A/B' with a simulated winner (A vs B).
     This is done per-simulation, so play-in uncertainty is reflected in outcomes.
@@ -204,14 +873,22 @@ def resolve_first_four(bracket: dict, rng: np.random.Generator) -> dict:
         for team, seed in matchups:
             if _is_play_in_team(team):
                 a, b = _split_play_in(team)
-                winner = simulate_game(a, b, rng)
+                winner = simulate_game(a, b, rng, _team_stats=_team_stats, _bracket=_bracket)
                 new_matchups.append((winner, seed))
             else:
                 new_matchups.append((team, seed))
         resolved[region] = new_matchups
     return resolved
 
-def simulate_tournament(bracket_data, num_simulations=1000000, *, rng: np.random.Generator, progress_every: int = 0):
+def simulate_tournament(
+    bracket_data,
+    num_simulations=1000000,
+    *,
+    rng: np.random.Generator,
+    progress_every: int = 0,
+    _team_stats: dict[str, list[float]] | None = None,
+    _bracket: dict | None = None,
+):
     """Simulate the entire tournament multiple times."""
     results = {
         'championship_wins': defaultdict(int),
@@ -220,32 +897,34 @@ def simulate_tournament(bracket_data, num_simulations=1000000, *, rng: np.random
         'sweet_sixteen': defaultdict(int),
         'round_32': defaultdict(int)
     }
-    
+    stats = _team_stats
+    br = _bracket
+
     for sim in range(num_simulations):
         if progress_every and sim % progress_every == 0:
             print(f"Running simulation {sim}/{num_simulations}")
             
-        current_bracket = resolve_first_four(bracket_data, rng)
+        current_bracket = resolve_first_four(bracket_data, rng, _team_stats=stats, _bracket=br)
         region_winners: dict[str, tuple[str, int]] = {}
         
         for region in current_bracket:
             # Round of 32
-            current_bracket[region] = simulate_round(current_bracket[region], rng)
+            current_bracket[region] = simulate_round(current_bracket[region], rng, _team_stats=stats, _bracket=br)
             for team, _ in current_bracket[region]:
                 results['round_32'][team] += 1
             
             # Sweet 16
-            current_bracket[region] = simulate_round(current_bracket[region], rng)
+            current_bracket[region] = simulate_round(current_bracket[region], rng, _team_stats=stats, _bracket=br)
             for team, _ in current_bracket[region]:
                 results['sweet_sixteen'][team] += 1
             
             # Elite 8
-            current_bracket[region] = simulate_round(current_bracket[region], rng)
+            current_bracket[region] = simulate_round(current_bracket[region], rng, _team_stats=stats, _bracket=br)
             for team, _ in current_bracket[region]:
                 results['elite_eight'][team] += 1
             
             # Final 4
-            regional_winner = simulate_round(current_bracket[region], rng)[0]
+            regional_winner = simulate_round(current_bracket[region], rng, _team_stats=stats, _bracket=br)[0]
             region_winners[region] = regional_winner
             results['final_four'][regional_winner[0]] += 1
         
@@ -258,8 +937,8 @@ def simulate_tournament(bracket_data, num_simulations=1000000, *, rng: np.random
         ]
 
         # Championship
-        championship_game = simulate_round(final_four, rng)
-        champion = simulate_round(championship_game, rng)[0][0]
+        championship_game = simulate_round(final_four, rng, _team_stats=stats, _bracket=br)
+        champion = simulate_round(championship_game, rng, _team_stats=stats, _bracket=br)[0][0]
         results['championship_wins'][champion] += 1
     
     return results
@@ -281,31 +960,205 @@ def print_results(results, num_simulations):
             prob = (appearances/num_simulations)*100
             print(f"{team}: {prob:.1f}% ({appearances} times)")
 
+def _build_seed_index(bracket: dict) -> dict[str, int]:
+    """
+    Map team name -> original seed using the bracket definition.
+    Play-in placeholders are expanded so that both underlying teams share the seed.
+    """
+    index: dict[str, int] = {}
+    for region_teams in bracket.values():
+        for name, seed in region_teams:
+            if _is_play_in_team(name):
+                a, b = _split_play_in(name)
+                index.setdefault(a, seed)
+                index.setdefault(b, seed)
+            else:
+                index.setdefault(name, seed)
+    return index
+
+def run_sanity_diagnostics(results, num_simulations: int, bracket: dict):
+    """
+    Post-simulation sanity diagnostics by seed.
+
+    Summarises odds by seed for key rounds and emits light warnings if patterns
+    look obviously strange (too many early exits for top seeds, too much chalk, etc.).
+    """
+    seed_index = _build_seed_index(bracket)
+
+    # Aggregate probabilities by seed.
+    def _agg(bucket_key: str) -> dict[int, float]:
+        bucket = results[bucket_key]
+        seed_probs: dict[int, float] = {}
+        for team, count in bucket.items():
+            seed = seed_index.get(team)
+            if seed is None:
+                continue
+            seed_probs.setdefault(seed, 0.0)
+            seed_probs[seed] += count / num_simulations
+        return seed_probs
+
+    champ_by_seed = _agg("championship_wins")
+    ff_by_seed = _agg("final_four")
+    s16_by_seed = _agg("sweet_sixteen")
+    r32_by_seed = _agg("round_32")
+
+    print("\n=== Seed-level sanity diagnostics ===")
+    print("Seed | Champ% | Final4% | Sweet16% | R32%")
+    for seed in range(1, 17):
+        c = champ_by_seed.get(seed, 0.0) * 100
+        f4 = ff_by_seed.get(seed, 0.0) * 100
+        s16 = s16_by_seed.get(seed, 0.0) * 100
+        r32 = r32_by_seed.get(seed, 0.0) * 100
+        if c + f4 + s16 + r32 == 0:
+            continue
+        print(f"{seed:>4} | {c:6.2f} | {f4:7.2f} | {s16:9.2f} | {r32:5.2f}")
+
+    # Simple heuristics for suspicious patterns.
+    warnings = []
+
+    # Top seeds exiting too early.
+    top_seed_r32 = sum(r32_by_seed.get(s, 0.0) for s in (1, 2)) / 2 or 0.0
+    if top_seed_r32 < 0.9:
+        warnings.append("Top seeds (1–2) reach Round of 32 less than 90% on average.")
+
+    # Too many double-digit seeds in Final Four.
+    low_seed_ff = sum(ff_by_seed.get(s, 0.0) for s in range(10, 17))
+    if low_seed_ff > 0.25:
+        warnings.append("Double-digit seeds account for more than 25% of Final Four appearances.")
+
+    # Too much chalk: 1–4 seeds dominate Final Four.
+    high_seed_ff = sum(ff_by_seed.get(s, 0.0) for s in range(1, 5))
+    if high_seed_ff > 0.95:
+        warnings.append("Seeds 1–4 account for more than 95% of Final Four appearances (very chalky).")
+
+    if warnings:
+        print("\nSanity warnings:")
+        for w in warnings:
+            print(f"- {w}")
+    else:
+        print("\nSanity checks: no obvious red flags detected.")
+
 def print_bracket_predictions(results, bracket_data):
     """
-    Print a visual representation of the predicted bracket based on simulation results.
+    Print visual bracket representations based on simulation results.
+
+    Two views:
+      1. Coherent matchup-based bracket (uses head-to-head win probabilities).
+      2. Marginal-probability bracket (uses advancement frequencies by round).
     """
     def get_most_likely_winner(team1, team2, round_results):
-        """Helper function to determine the most likely winner between two teams"""
+        """Helper for marginal bracket: decide winner from advancement counts."""
         prob1 = round_results.get(team1[0], 0)
         prob2 = round_results.get(team2[0], 0)
         return team1 if prob1 > prob2 else team2
 
+    def deterministic_winner(pair1, pair2):
+        """Helper for coherent bracket: decide winner from head-to-head probability."""
+        (t1, s1), (t2, s2) = pair1, pair2
+        # Handle play-in placeholders by using the first named team for rating purposes.
+        name1 = _split_play_in(t1)[0] if _is_play_in_team(t1) else t1
+        name2 = _split_play_in(t2)[0] if _is_play_in_team(t2) else t2
+        p = calculate_win_probability(name1, name2)
+        if p > 0.5:
+            return (t1, s1)
+        if p < 0.5:
+            return (t2, s2)
+        # Exact tie: choose better seed.
+        return (t1, s1) if s1 < s2 else (t2, s2)
+
     print("\n=== 2026 NCAA Tournament Predictions ===\n")
 
-    # Store predictions for each round
+    # ------------------------------------------------------------------
+    # 1) Coherent matchup-based bracket
+    # ------------------------------------------------------------------
+    print("=== Coherent matchup-based bracket (game win probabilities) ===")
+    matchup_region_winners = {}
+
+    for region in ['South', 'West', 'East', 'Midwest']:
+        print(f"\n{region} Region:")
+        print("=" * 50)
+
+        # First Round
+        current_round = bracket_data[region][:]
+        print("\nFirst Round:")
+        for i in range(0, len(current_round), 2):
+            team1 = current_round[i]
+            team2 = current_round[i + 1]
+            winner = deterministic_winner(team1, team2)
+            print(f"({team1[1]}) {team1[0]} vs ({team2[1]}) {team2[0]} → ({winner[1]}) {winner[0]}")
+        # Advance winners
+        next_round = []
+        for i in range(0, len(current_round), 2):
+            team1 = current_round[i]
+            team2 = current_round[i + 1]
+            winner = deterministic_winner(team1, team2)
+            next_round.append(winner)
+        current_round = next_round
+
+        # Round of 32
+        print("\nRound of 32:")
+        next_round = []
+        for i in range(0, len(current_round), 2):
+            team1 = current_round[i]
+            team2 = current_round[i + 1]
+            winner = deterministic_winner(team1, team2)
+            print(f"({team1[1]}) {team1[0]} vs ({team2[1]}) {team2[0]} → ({winner[1]}) {winner[0]}")
+            next_round.append(winner)
+        current_round = next_round
+
+        # Sweet 16
+        print("\nSweet 16:")
+        next_round = []
+        for i in range(0, len(current_round), 2):
+            team1 = current_round[i]
+            team2 = current_round[i + 1]
+            winner = deterministic_winner(team1, team2)
+            print(f"({team1[1]}) {team1[0]} vs ({team2[1]}) {team2[0]} → ({winner[1]}) {winner[0]}")
+            next_round.append(winner)
+        current_round = next_round
+
+        # Regional Final (Elite 8)
+        team1, team2 = current_round[0], current_round[1]
+        winner = deterministic_winner(team1, team2)
+        matchup_region_winners[region] = winner
+        print(f"\nRegional Final: ({team1[1]}) {team1[0]} vs ({team2[1]}) {team2[0]} → ({winner[1]}) {winner[0]}")
+
+    # Final Four (coherent)
+    print("\n=== Final Four (coherent bracket) ===")
+    east_south = deterministic_winner(matchup_region_winners['East'], matchup_region_winners['South'])
+    west_midwest = deterministic_winner(matchup_region_winners['West'], matchup_region_winners['Midwest'])
+    print(
+        f"East/South: ({matchup_region_winners['East'][1]}) {matchup_region_winners['East'][0]} vs "
+        + f"({matchup_region_winners['South'][1]}) {matchup_region_winners['South'][0]} → ({east_south[1]}) {east_south[0]}"
+    )
+    print(
+        f"West/Midwest: ({matchup_region_winners['West'][1]}) {matchup_region_winners['West'][0]} vs "
+        + f"({matchup_region_winners['Midwest'][1]}) {matchup_region_winners['Midwest'][0]} → ({west_midwest[1]}) {west_midwest[0]}"
+    )
+
+    coherent_champ = deterministic_winner(east_south, west_midwest)
+    print("\nChampionship Game (coherent bracket):")
+    print(
+        f"({east_south[1]}) {east_south[0]} vs ({west_midwest[1]}) {west_midwest[0]} → "
+        f"({coherent_champ[1]}) {coherent_champ[0]}"
+    )
+
+    # ------------------------------------------------------------------
+    # 2) Marginal-probability bracket
+    # ------------------------------------------------------------------
+    print("\n=== Marginal-probability bracket (advancement frequencies) ===")
+
+    # Store predictions for each round (by region + slot).
     predictions = {
         'round_32': {},
         'sweet_16': {},
         'elite_8': {},
     }
 
-    # Print each region
     for region in ['South', 'West', 'East', 'Midwest']:
         print(f"\n{region} Region:")
         print("=" * 50)
         
-        # First Round matchups (1v16, 8v9, 5v12, 4v13, 6v11, 3v14, 7v10, 2v15)
         first_round = bracket_data[region]
         matchups = [
             (0,1),   # 1 vs 16
@@ -324,7 +1177,7 @@ def print_bracket_predictions(results, bracket_data):
             winner = get_most_likely_winner(team1, team2, results['round_32'])
             predictions['round_32'][f"{region}_{i}"] = winner
             print(f"({team1[1]}) {team1[0]} vs ({team2[1]}) {team2[0]} → ({winner[1]}) {winner[0]}")
-
+        
         # Round of 32
         print("\nRound of 32:")
         r32_matchups = [
@@ -340,29 +1193,26 @@ def print_bracket_predictions(results, bracket_data):
             winner = get_most_likely_winner(team1, team2, results['sweet_sixteen'])
             predictions['sweet_16'][region + str(i)] = winner
             print(f"({team1[1]}) {team1[0]} vs ({team2[1]}) {team2[0]} → ({winner[1]}) {winner[0]}")
-
+        
         # Sweet 16
         print("\nSweet 16:")
-        # Top bracket game
         top_winner = get_most_likely_winner(
             predictions['sweet_16'][region + '0'],
             predictions['sweet_16'][region + '1'],
             results['elite_eight']
         )
-        # Bottom bracket game
         bottom_winner = get_most_likely_winner(
             predictions['sweet_16'][region + '2'],
             predictions['sweet_16'][region + '3'],
             results['elite_eight']
         )
         
-        # Elite 8 game for the region
         winner = get_most_likely_winner(top_winner, bottom_winner, results['final_four'])
         predictions['elite_8'][region] = winner
         print(f"Regional Final: ({top_winner[1]}) {top_winner[0]} vs ({bottom_winner[1]}) {bottom_winner[0]} → ({winner[1]}) {winner[0]}")
-
-    # Final Four
-    print("\n=== Final Four ===")
+        
+    # Final Four (marginal)
+    print("\n=== Final Four (marginal bracket) ===")
     east_south = get_most_likely_winner(
         predictions['elite_8']['East'],
         predictions['elite_8']['South'],
@@ -383,68 +1233,174 @@ def print_bracket_predictions(results, bracket_data):
         + f"({predictions['elite_8']['Midwest'][1]}) {predictions['elite_8']['Midwest'][0]} → ({west_midwest[1]}) {west_midwest[0]}"
     )
     
-    # Championship
-    print("\nChampionship Game:")
+    # Championship (marginal)
+    print("\nChampionship Game (marginal bracket):")
     champion = get_most_likely_winner(east_south, west_midwest, results['championship_wins'])
     print(f"({east_south[1]}) {east_south[0]} vs ({west_midwest[1]}) {west_midwest[0]} → ({champion[1]}) {champion[0]}")
     
-    print("\n=== 2026 Champion ===")
+    print("\n=== 2026 Champion (marginal bracket) ===")
     print(f"({champion[1]}) {champion[0]}")
 
-def _ensure_team_tempo_stats(bracket: dict) -> dict[str, dict[str, float]]:
-    """
-    Build a tempo-based stats dict for score predictions:
-      {team: {offense, defense, tempo}}
-    Ensures all bracket teams are present, derived from `team_stats`.
-    """
-    tempo_stats: dict[str, dict[str, float]] = {}
-    for team, seed in _iter_bracket_teams(bracket):
-        # For play-in placeholders, store stats for the underlying teams too.
-        teams_to_add = [team]
-        if _is_play_in_team(team):
-            teams_to_add = list(_split_play_in(team))
 
-        for t in teams_to_add:
-            overall, off_eff, def_eff, _, _ = team_stats[t]
-            tempo = 66.0 + (overall - 70.0) * 0.12 + (8 - seed) * 0.04
-            tempo_stats[t] = {
-                "offense": float(np.clip(off_eff, 98.0, 126.0)),
-                "defense": float(np.clip(def_eff, 85.0, 112.0)),
-                "tempo": float(np.clip(tempo, 62.0, 72.0)),
-            }
-    return tempo_stats
+# Score model calibration constants.
+# These are intentionally easy to tune.
+# NCAA tournament games tend slightly lower than regular-season D1 averages.
+LEAGUE_AVG_PPP = 1.02  # was 1.06; modest reduction for neutral-court tourney totals
+LEAGUE_AVG_TEMPO = 67.0  # possessions per game (40 minutes)
 
-team_tempo_stats = _ensure_team_tempo_stats(bracket_data)
+# How strongly offense/defense affect PPP (bounded; see `_bounded_ppp_adjustment`).
+PPP_ADJ_STRENGTH = 0.06  # was 0.075; slightly less boost to cap high-scoring games
+EFFICIENCY_SCALE = 15.0  # points/100 possessions scale for "one strong deviation"
+
+# Randomness controls (preserve variance for realistic spread).
+TEMPO_GAME_SD = 2.0  # game-to-game possessions variability
+PPP_GAME_SD = 0.032  # was 0.035; slight reduction in shared upward drift
+PPP_TEAM_SD = 0.042  # was 0.045; slight reduction, preserves matchup variance
+
+# Guardrails for realism.
+PPP_MIN = 0.85
+PPP_MAX = 1.22  # was 1.25; 160+ totals possible but less common
+POSS_MIN = 58.0  # possession bounds (tourney games often slightly slower)
+POSS_MAX = 72.0  # was 60-75
+SCORE_MIN = 45
+SCORE_MAX = 95
+SCORE_NOISE_SD = 2.5  # final rounding/noise per team (preserves variance)
+
+def _bounded_ppp_adjustment(off_eff: float, opp_def_eff: float) -> float:
+    """
+    Convert (offense, opponent defense) efficiencies (pts/100 poss) into a *modest*
+    additive PPP adjustment around league average.
+
+    We use tanh() to bound the adjustment so no matchup explodes totals.
+    """
+    # Higher off_eff is better; lower opp_def_eff is better defense.
+    off_z = (off_eff - 110.0) / EFFICIENCY_SCALE
+    def_z = (100.0 - opp_def_eff) / EFFICIENCY_SCALE
+    return PPP_ADJ_STRENGTH * (np.tanh(off_z) + np.tanh(def_z))
 
 def predict_game_score(team1, team2, rng: np.random.Generator):
-    """Predict the score for a game between two teams"""
+    """
+    Predict the score for a game between two teams.
+
+    Calibration intent:
+    - Typical totals ~130–150 for neutral-court NCAA tournament games
+    - Low-scoring games are possible; high-scoring (160+) possible but less common
+    """
     if team1 not in team_tempo_stats or team2 not in team_tempo_stats:
         raise ValueError(f"Missing stats for {team1} or {team2}")
     
-    # Average the tempo of both teams to estimate possessions
-    possessions = (team_tempo_stats[team1]['tempo'] + team_tempo_stats[team2]['tempo']) / 2
-    
-    # Calculate points per possession
-    team1_ppp = team_tempo_stats[team1]['offense'] / 100
-    team2_ppp = team_tempo_stats[team2]['offense'] / 100
-    
-    # Adjust for opponent's defense
-    team1_ppp *= (100 / team_tempo_stats[team2]['defense'])
-    team2_ppp *= (100 / team_tempo_stats[team1]['defense'])
-    
-    # Calculate base scores
-    team1_base = team1_ppp * possessions
-    team2_base = team2_ppp * possessions
-    
-    # Add random variation
-    team1_score = round(team1_base + rng.normal(0, 3.5))
-    team2_score = round(team2_base + rng.normal(0, 3.5))
+    t1 = team_tempo_stats[team1]
+    t2 = team_tempo_stats[team2]
+
+    # 1) Possessions: average both tempos + a small game-level tempo wobble.
+    base_possessions = (t1["tempo"] + t2["tempo"]) / 2
+    possessions = base_possessions + rng.normal(0, TEMPO_GAME_SD)
+    possessions = float(np.clip(possessions, POSS_MIN, POSS_MAX))
+
+    # 2) PPP: start at league average, then apply bounded offense/defense adjustments.
+    game_env = rng.normal(0, PPP_GAME_SD)  # shared shift affecting both teams
+
+    t1_adj = _bounded_ppp_adjustment(t1["offense"], t2["defense"])
+    t2_adj = _bounded_ppp_adjustment(t2["offense"], t1["defense"])
+
+    team1_ppp = LEAGUE_AVG_PPP + game_env + t1_adj + rng.normal(0, PPP_TEAM_SD)
+    team2_ppp = LEAGUE_AVG_PPP + game_env + t2_adj + rng.normal(0, PPP_TEAM_SD)
+
+    team1_ppp = float(np.clip(team1_ppp, PPP_MIN, PPP_MAX))
+    team2_ppp = float(np.clip(team2_ppp, PPP_MIN, PPP_MAX))
+
+    # 3) Convert to points. A small final rounding noise approximates end-game fouling,
+    #    late threes, and the fact that PPP isn't perfectly stationary.
+    team1_score = round(team1_ppp * possessions + rng.normal(0, SCORE_NOISE_SD))
+    team2_score = round(team2_ppp * possessions + rng.normal(0, SCORE_NOISE_SD))
     
     # Ensure reasonable scores
-    team1_score = max(40, min(105, team1_score))
-    team2_score = max(40, min(105, team2_score))
+    team1_score = max(SCORE_MIN, min(SCORE_MAX, team1_score))
+    team2_score = max(SCORE_MIN, min(SCORE_MAX, team2_score))
     
     return team1_score, team2_score
+
+def _resolve_team_for_win_prob(name: str) -> str:
+    """Use first team of play-in placeholder for calculate_win_probability lookup."""
+    return _split_play_in(name)[0] if _is_play_in_team(name) else name
+
+
+def _build_projected_matchups(bracket: dict) -> tuple[list[tuple[tuple[str, int], tuple[str, int]]], list[tuple[tuple[str, int], tuple[str, int]]], tuple[tuple[str, int], tuple[str, int]] | None]:
+    """
+    Build projected Elite Eight, Final Four, and Championship matchups from the
+    coherent (deterministic win-probability) bracket.
+    Returns (elite_eight_matchups, final_four_matchups, championship_matchup).
+    """
+    def winner(pair1, pair2):
+        (t1, s1), (t2, s2) = pair1, pair2
+        n1 = _resolve_team_for_win_prob(t1)
+        n2 = _resolve_team_for_win_prob(t2)
+        p = calculate_win_probability(n1, n2)
+        if p > 0.5:
+            return (t1, s1)
+        if p < 0.5:
+            return (t2, s2)
+        return (t1, s1) if s1 < s2 else (t2, s2)
+
+    elite_eight = []
+    region_winners = {}
+
+    for region in ["South", "West", "East", "Midwest"]:
+        current = bracket[region][:]
+        for _ in range(3):  # R64 -> R32 -> S16
+            next_round = []
+            for i in range(0, len(current), 2):
+                w = winner(current[i], current[i + 1])
+                next_round.append(w)
+            current = next_round
+        team1, team2 = current[0], current[1]
+        elite_eight.append((team1, team2))
+        region_winners[region] = winner(team1, team2)
+
+    east_south = winner(region_winners["East"], region_winners["South"])
+    west_midwest = winner(region_winners["West"], region_winners["Midwest"])
+    final_four = [
+        (region_winners["East"], region_winners["South"]),
+        (region_winners["West"], region_winners["Midwest"]),
+    ]
+    championship = (east_south, west_midwest)
+    return elite_eight, final_four, championship
+
+
+def print_matchup_win_probabilities(bracket: dict):
+    """
+    Print head-to-head win probabilities for projected Elite Eight, Final Four,
+    and Championship matchups (from the coherent bracket).
+    """
+    elite_eight, final_four, championship = _build_projected_matchups(bracket)
+
+    print("\n=== Matchup Win Probabilities ===")
+
+    print("\nElite Eight (Regional Finals):")
+    for (t1, s1), (t2, s2) in elite_eight:
+        n1 = _resolve_team_for_win_prob(t1)
+        n2 = _resolve_team_for_win_prob(t2)
+        p1 = calculate_win_probability(n1, n2)
+        p2 = 1.0 - p1
+        print(f"  {t1} vs {t2}: {t1} {p1*100:.1f}%, {t2} {p2*100:.1f}%")
+
+    print("\nFinal Four:")
+    for (t1, s1), (t2, s2) in final_four:
+        n1 = _resolve_team_for_win_prob(t1)
+        n2 = _resolve_team_for_win_prob(t2)
+        p1 = calculate_win_probability(n1, n2)
+        p2 = 1.0 - p1
+        print(f"  {t1} vs {t2}: {t1} {p1*100:.1f}%, {t2} {p2*100:.1f}%")
+
+    if championship:
+        (t1, s1), (t2, s2) = championship
+        n1 = _resolve_team_for_win_prob(t1)
+        n2 = _resolve_team_for_win_prob(t2)
+        p1 = calculate_win_probability(n1, n2)
+        p2 = 1.0 - p1
+        print("\nChampionship:")
+        print(f"  {t1} vs {t2}: {t1} {p1*100:.1f}%, {t2} {p2*100:.1f}%")
+
 
 def analyze_championship_scoring(final_four_teams, rng: np.random.Generator, *, sims_per_matchup: int = 1000):
     """Analyze potential scoring outcomes for all possible championship matchups"""
@@ -498,6 +1454,8 @@ if __name__ == "__main__":
     parser.add_argument("--progress-every", type=int, default=0, help="Print progress every N simulations (0 = off)")
     parser.add_argument("--no-scoring", action="store_true", help="Skip championship scoring analysis")
     parser.add_argument("--score-sims", type=int, default=1000, help="Simulations per matchup in scoring analysis")
+    parser.add_argument("--sanity-checks", action="store_true", help="Print seed-level sanity diagnostics after simulations")
+    parser.add_argument("--pool-ev", action="store_true", help="Print bracket pool EV: chalk vs contrarian (R64 proof-of-concept)")
     args = parser.parse_args()
 
     validate_bracket(bracket_data)
@@ -511,9 +1469,47 @@ if __name__ == "__main__":
         progress_every=args.progress_every,
     )
     print_results(simulation_results, args.num_simulations)
+    print_seed_matchup_diagnostics(bracket_data)
     print_bracket_predictions(simulation_results, bracket_data)
 
+    if args.sanity_checks:
+        run_sanity_diagnostics(simulation_results, args.num_simulations, bracket_data)
+
+    if args.pool_ev:
+        pool_cfg = BracketPoolConfig()
+        # Proof-of-concept: chalk vs one contrarian
+        comp = compare_chalk_vs_contrarian(
+            simulation_results, args.num_simulations, bracket_data, pool_config=pool_cfg
+        )
+        print("\n=== Bracket Pool EV (R64 proof-of-concept) ===")
+        print(f"Chalk expected score: {comp['chalk_ev']:.2f}")
+        print(f"Contrarian (1 upset) expected score: {comp['contrarian_ev']:.2f}")
+        if comp.get("contrarian_game"):
+            fav, underdog = comp["contrarian_game"]
+            print(f"Contrarian game: {underdog} over {fav}")
+
+        # Bracket variants: chalk, light, medium, high variance
+        variants = compare_bracket_variants(
+            simulation_results, args.num_simulations, bracket_data, pool_config=pool_cfg
+        )
+        print("\n=== Bracket Variants (R64 expected score) ===")
+        for name, ev in variants.items():
+            label = name.replace("_", " ").title()
+            print(f"  {label}: {ev:.2f}")
+
+        # Best single-upset swaps by EV (least cost first)
+        ranked = rank_single_upset_swaps(
+            simulation_results, args.num_simulations, bracket_data, pool_cfg, top_n=8
+        )
+        print("\n=== Best Single-Upset Swaps (by EV impact) ===")
+        print("  Pick underdog in these games for least EV cost:")
+        for i, ((fav, underdog), ev_upset, ev_change, (hi, lo)) in enumerate(ranked, 1):
+            print(f"  {i}. {lo}v{hi}: {underdog} over {fav}  (EV={ev_upset:.2f}, Δ={ev_change:+.2f})")
+
     if not args.no_scoring:
+        # Matchup win probabilities for projected Elite Eight, Final Four, Championship
+        print_matchup_win_probabilities(bracket_data)
+
         # Get Final Four teams (most frequent by region) and analyze scoring
         final_four_teams = []
         for region in ["South", "West", "East", "Midwest"]:
