@@ -305,6 +305,25 @@ def _build_picks_with_upsets(
     return picks
 
 
+def _leverage_score(
+    p_underdog: float,
+    p_fav: float,
+    hi_seed: int,
+    lo_seed: int,
+) -> float:
+    """
+    Simple leverage score for an upset pick: balances win probability, seed spread,
+    and contrarian value (popularity proxy = p_fav, higher = more chalk-heavy = more leverage when we deviate).
+
+    leverage = p_underdog * seed_diff * p_fav
+    - p_underdog: chance upset hits (we want non-trivial)
+    - seed_diff: magnitude of upset (12v5 > 9v8)
+    - p_fav: popularity proxy (high = most pick favorite = we differentiate more)
+    """
+    seed_diff = lo_seed - hi_seed
+    return p_underdog * seed_diff * p_fav
+
+
 def rank_single_upset_swaps(
     simulation_results: dict,
     num_simulations: int,
@@ -312,18 +331,17 @@ def rank_single_upset_swaps(
     pool_config: BracketPoolConfig,
     seed_index: dict[str, int] | None = None,
     top_n: int = 10,
-) -> list[tuple[tuple[str, str], float, float, tuple[int, int]]]:
+) -> list[tuple[tuple[str, str], float, float, tuple[int, int], float, float, float]]:
     """
     Rank R64 games by EV impact of picking underdog instead of chalk.
 
-    Returns list of (game, ev_with_upset, ev_change, (hi_seed, lo_seed)) sorted by
-    ev_change descending (least-bad upsets first). top_n limits results.
+    Returns list of (game, ev_with_upset, ev_change, (hi_seed, lo_seed), p_underdog, p_fav, leverage)
+    sorted by ev_change descending (least-bad upsets first). top_n limits results.
     """
     r32 = simulation_results["round_32"]
     n = num_simulations
     games = _build_first_round_matchups(bracket)
     seed_idx = seed_index or _build_seed_index(bracket)
-    pts = pool_config.round_64
 
     chalk_picks = _build_chalk_picks(simulation_results, n, bracket)
     chalk_ev = expected_bracket_score_r64(
@@ -353,10 +371,28 @@ def rank_single_upset_swaps(
         s2 = seed_idx.get(_split_play_in(t2)[0] if _is_play_in_team(t2) else t2, 99)
         hi_seed, lo_seed = (s1, s2) if s1 < s2 else (s2, s1)
 
-        swaps.append(((fav, underdog), ev_upset, ev_change, (hi_seed, lo_seed)))
+        leverage = _leverage_score(p_underdog, p_fav, hi_seed, lo_seed)
+        swaps.append(((fav, underdog), ev_upset, ev_change, (hi_seed, lo_seed), p_underdog, p_fav, leverage))
 
     swaps.sort(key=lambda x: -x[2])  # highest ev_change first (least bad)
     return swaps[:top_n]
+
+
+# Weight for leverage when computing leverage-adjusted ranking (EV cost vs differentiation).
+LEVERAGE_WEIGHT = 0.4  # leverage_adjusted = ev_change + LEVERAGE_WEIGHT * leverage
+
+
+def rank_upsets_by_leverage(
+    swaps: list[tuple[tuple[str, str], float, float, tuple[int, int], float, float, float]],
+    leverage_weight: float = LEVERAGE_WEIGHT,
+) -> list[tuple[tuple[str, str], float, float, tuple[int, int], float, float, float]]:
+    """
+    Re-rank upset swaps by leverage-adjusted value: ev_change + leverage_weight * leverage.
+    Balances expected points cost with bracket differentiation potential.
+    """
+    scored = [(s, s[2] + leverage_weight * s[6]) for s in swaps]
+    scored.sort(key=lambda x: -x[1])  # highest combined score first
+    return [s[0] for s in scored]
 
 
 def compare_bracket_variants(
@@ -565,6 +601,11 @@ def _seed_based_overall(seed: int) -> float:
     seed = max(1, min(16, int(seed)))
     return 92.0 - (seed - 1) * 3.0  # 1-seed ~92, 16-seed ~47
 
+# Seed hierarchy: ensure overrides don't invert seed-line strength (e.g. 2-seed > 1-seed).
+# Applied when building metrics: 1-seeds floored, higher seeds capped below lower-seed baseline.
+# Larger gap = stronger monotonicity; 1.5 keeps 2-seeds below 1-seeds even with off/def variation.
+SEED_HIERARCHY_GAP = 1.5  # minimum gap between adjacent seed lines
+
 def _iter_bracket_teams(bracket: dict) -> list[tuple[str, int]]:
     teams: list[tuple[str, int]] = []
     for region_matchups in bracket.values():
@@ -589,8 +630,18 @@ def _build_fallback_metrics(team: str, seed: int, overall_override: float | None
 
     Uses deterministic per-team variation so similar overall ratings can still
     differ in offense/defense profile, experience, and coaching.
+
+    When overall_override is provided, applies seed hierarchy bounds so that
+    average seed-line strength is monotonic (1-seeds >= 2-seeds >= ...).
     """
-    base_overall = float(overall_override if overall_override is not None else _seed_based_overall(seed))
+    raw_overall = float(overall_override if overall_override is not None else _seed_based_overall(seed))
+    # Enforce monotonic seed hierarchy: floor 1-seeds, cap higher seeds below lower-seed baseline
+    seed_int = max(1, min(16, int(seed)))
+    if seed_int == 1:
+        base_overall = max(raw_overall, _seed_based_overall(1))
+    else:
+        cap = _seed_based_overall(seed_int - 1) - SEED_HIERARCHY_GAP
+        base_overall = min(raw_overall, cap)
     rng = np.random.default_rng(_team_seed_from_name(team))
 
     style = rng.normal(0.0, 0.7)
@@ -693,6 +744,9 @@ LOGISTIC_SCALE = 14.0  # was 12.0; modest increase for realistic early-round ups
 # Seed-based nudge: better seeds get a small bump. Lower = less chalk amplification.
 SEED_EDGE_STRENGTH = 0.65  # was 0.8; reduced to avoid over-amplifying favorites, but keep 1v16 strong
 
+# Extra nudge for 1v16 so average stays above 2v15 despite play-in 16 variance.
+SEED_1v16_BONUS = 2.0  # added to seed_edge when higher seed is 1 and lower is 16
+
 def _composite_rating(stats: list[float]) -> float:
     """
     Map raw team factors -> a single composite rating.
@@ -755,6 +809,9 @@ def calculate_win_probability(
 
     if seed1 is not None and seed2 is not None:
         seed_edge = (seed2 - seed1) * SEED_EDGE_STRENGTH
+        # Ensure 1v16 average stays above 2v15 (play-in 16s can have high variance)
+        if (seed1, seed2) in ((1, 16), (16, 1)):
+            seed_edge += SEED_1v16_BONUS if seed1 == 1 else -SEED_1v16_BONUS
     else:
         seed_edge = 0.0
 
@@ -767,10 +824,38 @@ def calculate_win_probability(
     # Guard against exact 0 or 1 from extreme diffs / numeric limits.
     return float(np.clip(prob, 1e-4, 1.0 - 1e-4))
 
+
+def _canonical_seed_win_prob(hi_seed: int, lo_seed: int) -> float:
+    """
+    Win probability for higher seed when both teams use seed-based ratings only.
+    Uses _seed_based_overall and deterministic off/def/exp/coach (no per-team noise).
+    Ensures monotonic seed-line expectation: 1v16 >= 2v15 >= ... >= 8v9.
+    """
+    def _seed_stats(s: int) -> list[float]:
+        overall = _seed_based_overall(s)
+        off_base = 100.0 + (overall - 70.0) * 0.8
+        def_base = 105.0 - (overall - 70.0) * 0.6
+        exp_base = 6.3 + (8 - min(s, 16)) * 0.08
+        coach_base = 6.0 + (overall - 75.0) / 12.0
+        return [overall, off_base, def_base, exp_base, coach_base]
+
+    r1 = _composite_rating(_seed_stats(hi_seed))
+    r2 = _composite_rating(_seed_stats(lo_seed))
+    seed_edge = (lo_seed - hi_seed) * SEED_EDGE_STRENGTH
+    if (hi_seed, lo_seed) == (1, 16):
+        seed_edge += SEED_1v16_BONUS
+    rating_diff = r1 - r2 + seed_edge
+    x = rating_diff / LOGISTIC_SCALE
+    return float(np.clip(1.0 / (1.0 + np.exp(-x)), 1e-4, 1.0 - 1e-4))
+
+
 def print_seed_matchup_diagnostics(bracket: dict | None = None):
     """
-    Lightweight calibration helper: prints implied upset probabilities for
-    common seed matchups (1v16, 2v15, ..., 8v9) using current parameters.
+    Calibration helper: prints implied upset probabilities for common seed matchups.
+
+    Two tables:
+    1. Raw: average higher-seed win prob from actual field (team-specific ratings)
+    2. Normalized: seed-line expectation from model inputs only (_seed_based_overall, no overrides)
 
     bracket: optional override; when None, uses bracket_data.
     """
@@ -786,15 +871,12 @@ def print_seed_matchup_diagnostics(bracket: dict | None = None):
         (8, 9),
     ]
 
-    # Build a reverse index: (seed, region) -> team name, choosing a
-    # representative team for that seed in that region.
+    # Build (seed, region) -> team name
     seed_index: dict[tuple[int, str], str] = {}
     for region, teams in br.items():
         for name, seed in teams:
             key = (seed, region)
             if key not in seed_index:
-                # If this is a play-in placeholder, take the first named team
-                # as a representative for diagnostics.
                 if _is_play_in_team(name):
                     rep, _ = _split_play_in(name)
                     seed_index[key] = rep
@@ -803,7 +885,10 @@ def print_seed_matchup_diagnostics(bracket: dict | None = None):
 
     regions = ["South", "West", "East", "Midwest"]
 
-    print("\nSeed matchup diagnostics (prob = higher-seed win probability):")
+    # 1) Raw: actual field (team overrides, synthetic factors)
+    print("\nSeed matchup diagnostics (higher-seed win probability):")
+    print("\n  Raw (actual field, avg over 4 regions):")
+    raw_probs = {}
     for hi, lo in pairs:
         probs = []
         for region in regions:
@@ -814,7 +899,14 @@ def print_seed_matchup_diagnostics(bracket: dict | None = None):
                 probs.append(p)
         if probs:
             avg = sum(probs) / len(probs)
-            print(f"{hi} vs {lo}: avg higher-seed win prob ≈ {avg:.3f} over {len(probs)} region(s)")
+            raw_probs[(hi, lo)] = avg
+            print(f"    {hi} vs {lo}: {avg:.3f}")
+
+    # 2) Normalized: seed-line expectation (model inputs only, monotonic by design)
+    print("\n  Normalized (seed-line expectation, no team overrides):")
+    for hi, lo in pairs:
+        canon = _canonical_seed_win_prob(hi, lo)
+        print(f"    {hi} vs {lo}: {canon:.3f}")
 
 def simulate_game(
     team1: str,
@@ -1497,14 +1589,21 @@ if __name__ == "__main__":
             label = name.replace("_", " ").title()
             print(f"  {label}: {ev:.2f}")
 
-        # Best single-upset swaps by EV (least cost first)
-        ranked = rank_single_upset_swaps(
-            simulation_results, args.num_simulations, bracket_data, pool_cfg, top_n=8
+        # Best single-upset swaps: by EV (least cost) and by leverage-adjusted (differentiation)
+        all_swaps = rank_single_upset_swaps(
+            simulation_results, args.num_simulations, bracket_data, pool_cfg, top_n=20
         )
         print("\n=== Best Single-Upset Swaps (by EV impact) ===")
-        print("  Pick underdog in these games for least EV cost:")
-        for i, ((fav, underdog), ev_upset, ev_change, (hi, lo)) in enumerate(ranked, 1):
-            print(f"  {i}. {lo}v{hi}: {underdog} over {fav}  (EV={ev_upset:.2f}, Δ={ev_change:+.2f})")
+        print("  Pick underdog for least EV cost (lev = leverage: P(underdog)×seed_diff×P(fav)):")
+        for i, ((fav, underdog), ev_upset, ev_change, (hi, lo), p_underdog, p_fav, leverage) in enumerate(all_swaps[:8], 1):
+            print(f"  {i}. {lo}v{hi}: {underdog} over {fav}  (EV={ev_upset:.2f}, Δ={ev_change:+.2f}, lev={leverage:.2f})")
+
+        by_leverage = rank_upsets_by_leverage(all_swaps)
+        print("\n=== Best Single-Upset Swaps (by leverage-adjusted) ===")
+        print("  Pick underdog for best EV + differentiation (adj = Δ + 0.4×lev):")
+        for i, ((fav, underdog), ev_upset, ev_change, (hi, lo), p_underdog, p_fav, leverage) in enumerate(by_leverage[:8], 1):
+            adj = ev_change + LEVERAGE_WEIGHT * leverage
+            print(f"  {i}. {lo}v{hi}: {underdog} over {fav}  (EV={ev_upset:.2f}, Δ={ev_change:+.2f}, lev={leverage:.2f}, adj={adj:+.2f})")
 
     if not args.no_scoring:
         # Matchup win probabilities for projected Elite Eight, Final Four, Championship
